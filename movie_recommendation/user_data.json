@@ -1,0 +1,134 @@
+{
+  "userId": "user_default",
+  "preferences": [
+    {
+      "id": "36086210",
+      "name": "照明商店",
+      "title": "照明商店",
+      "genres": [
+        "悬疑"
+      ],
+      "rating": "6.2",
+      "cover_url": "",
+      "year": 0,
+      "director": "",
+      "actors": ""
+    },
+    {
+      "id": "36653918",
+      "name": "抓娃娃",
+      "title": "抓娃娃",
+      "genres": [
+        "喜剧"
+      ],
+      "rating": "7.1",
+      "cover_url": "",
+      "year": 0,
+      "director": "",
+      "actors": ""
+    },
+    {
+      "id": "36208094",
+      "name": "第二十条",
+      "title": "第二十条",
+      "genres": [
+        "喜剧"
+      ],
+      "rating": "7.5",
+      "cover_url": "",
+      "year": 0,
+      "director": "",
+      "actors": ""
+    },
+    {
+      "id": "35575567",
+      "name": "沙丘2",
+      "title": "沙丘2",
+      "genres": [
+        "科幻"
+      ],
+      "rating": "8.1",
+      "cover_url": "",
+      "year": 0,
+      "director": "",
+      "actors": ""
+    },
+    {
+      "id": "34960078",
+      "name": "变形金刚：起源",
+      "title": "变形金刚：起源",
+      "genres": [
+        "科幻"
+      ],
+      "rating": "7.9",
+      "cover_url": "",
+      "year": 0,
+      "director": "",
+      "actors": ""
+    },
+    {
+      "id": "36689857",
+      "name": "荒野机器人",
+      "title": "荒野机器人",
+      "genres": [
+        "科幻"
+      ],
+      "rating": "8.1",
+      "cover_url": "",
+      "year": 0,
+      "director": "",
+      "actors": ""
+    },
+    {
+      "id": "34996971",
+      "name": "寂静之地：入侵日",
+      "title": "寂静之地：入侵日",
+      "genres": [
+        "科幻"
+      ],
+      "rating": "5.5",
+      "cover_url": "",
+      "year": 0,
+      "director": "",
+      "actors": ""
+    },
+    {
+      "id": "36406672",
+      "name": "饥饿站台2",
+      "title": "饥饿站台2",
+      "genres": [
+        "科幻"
+      ],
+      "rating": "5.6",
+      "cover_url": "",
+      "year": 0,
+      "director": "",
+      "actors": ""
+    },
+    {
+      "id": "34882958",
+      "name": "巨齿鲨2：深渊",
+      "title": "巨齿鲨2：深渊",
+      "genres": [
+        "科幻"
+      ],
+      "rating": "5.0",
+      "cover_url": "",
+      "year": 0,
+      "director": "",
+      "actors": ""
+    }
+  ],
+  "count_weights": {
+    "科幻": 6,
+    "喜剧": 2,
+    "悬疑": 1
+  },
+  "negative_feedback": [],
+  "watch_history": [],
+  "liked_items": [],
+  "disliked_items": [],
+  "blacklist": [],
+  "behavior": [],
+  "last_refresh_time": "2025-11-25 14:08:24"
+}
