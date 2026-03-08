@@ -253,8 +253,8 @@ else:
 
 # 导入config
 try:
-    from config import Config, init_directories
-
+    from config import Config
+    
     print("✅ 成功导入config模块")
 except ImportError as e:
     print(f"⚠️ 导入config失败，使用内置配置: {e}")
@@ -878,9 +878,6 @@ def force_refresh_all_recommendations():
     generate_and_save_recommendations('series', force_refresh=True)
     print("✅ 所有推荐已强制刷新！")
 
-
-# 初始化目录
-init_directories()
 
 # 测试代码
 if __name__ == "__main__":

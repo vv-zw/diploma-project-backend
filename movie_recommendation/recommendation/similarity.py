@@ -51,7 +51,6 @@ except ImportError as e:
 # 尝试导入配置，如果失败则创建默认配置
 try:
     from config import Config
-
     config_instance = Config()
     print("✅ 成功加载配置文件")
 except ImportError as e:

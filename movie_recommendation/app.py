@@ -925,7 +925,22 @@ import random
 from datetime import datetime
 from flask import Flask, jsonify, request, make_response, send_file
 import pandas as pd
-import imghdr  # 移到顶部
+
+# imghdr 在 Python 3.13+ 中已移除，使用替代方案
+def detect_image_type(image_data):
+    """检测图片类型（替代 imghdr）"""
+    if image_data[:8] == b'\x89PNG\r\n\x1a\n':
+        return 'png'
+    elif image_data[:3] == b'\xff\xd8\xff':
+        return 'jpeg'
+    elif image_data[:6] in (b'GIF87a', b'GIF89a'):
+        return 'gif'
+    elif image_data[:4] == b'RIFF' and image_data[8:12] == b'WEBP':
+        return 'webp'
+    elif image_data[:2] == b'BM':
+        return 'bmp'
+    else:
+        return 'jpeg'  # 默认
 
 # Flask应用初始化
 from flask_cors import CORS
@@ -1504,7 +1519,7 @@ def proxy_image_route():
             return jsonify({"code": 404, "error": "图片获取失败"}), 404
 
         # 获取文件类型
-        img_type = imghdr.what(None, image_data) or 'jpeg'
+        img_type = detect_image_type(image_data)
         resp = make_response(image_data)
         resp.headers["Content-Type"] = f"image/{img_type}"
         resp.headers["Cache-Control"] = "public, max-age=86400"  # 缓存1天

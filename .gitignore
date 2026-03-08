@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 虚拟环境
+venv/
+venv312/
+env/
+ENV/
+movie_recommendation/venv/
+微信小程序/.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 数据文件 (保留必要的配置文件，忽略生成的数据)
+*.csv
+*.json
+!requirements.json
+!package.json
+!app.json
+!sitemap.json
+!project.config.json
+
+# 忽略具体的业务数据文件
+data/
+movie_recommendation/data/
+!movie_recommendation/data/__init__.py
+!movie_recommendation/data/dataset_loader.py
+!movie_recommendation/data/user_manager.py
+
+# 缓存
+cache/
+*.cache
+movie_recommendation/image_cache/
+
+# 日志
+logs/
+*.log
+
+# 环境变量
+.env
+.env.local
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 临时文件
+temp/
+tmp/
+*.tmp
+
+# 数据库
+*.db
+*.sqlite
+*.sqlite3
+
+# 模型文件
+*.pth
+*.pt
+*.h5
+*.pkl
+*.pickle
+
+# 微信小程序
+微信小程序/node_modules/
+微信小程序/miniprogram_npm/
+微信小程序/unpackage/
+微信小程序/dist/

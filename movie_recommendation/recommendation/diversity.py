@@ -43,8 +43,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 # 尝试导入配置，如果失败则创建默认配置
 try:
-    from movie_recommendation.config import Config
-
+    from config import Config
     config_instance = Config()
     print("✅ 成功加载配置文件")
 except (ImportError, ModuleNotFoundError) as e:

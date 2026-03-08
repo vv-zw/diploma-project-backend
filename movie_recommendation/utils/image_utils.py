@@ -1,10 +1,28 @@
 import requests
 import os
 import hashlib
-import imghdr
 from urllib.parse import urlparse
 from flask import make_response
 from config import Config
+
+
+def detect_image_type(image_data):
+    """检测图片类型（替代 imghdr，兼容 Python 3.13+）"""
+    if not image_data:
+        return 'jpeg'
+    
+    if image_data[:8] == b'\x89PNG\r\n\x1a\n':
+        return 'png'
+    elif image_data[:3] == b'\xff\xd8\xff':
+        return 'jpeg'
+    elif image_data[:6] in (b'GIF87a', b'GIF89a'):
+        return 'gif'
+    elif image_data[:4] == b'RIFF' and image_data[8:12] == b'WEBP':
+        return 'webp'
+    elif image_data[:2] == b'BM':
+        return 'bmp'
+    else:
+        return 'jpeg'  # 默认
 
 def is_allowed_domain(url):
     """检查URL域名是否在允许列表中"""
