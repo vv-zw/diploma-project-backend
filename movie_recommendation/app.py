@@ -922,9 +922,19 @@ import json
 import os
 import traceback
 import random
+import sys
 from datetime import datetime
 from flask import Flask, jsonify, request, make_response, send_file
 import pandas as pd
+
+# Force UTF-8 console output on Windows to avoid emoji log crashes under GBK code page.
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 # imghdr 在 Python 3.13+ 中已移除，使用替代方案
 def detect_image_type(image_data):
@@ -950,9 +960,9 @@ try:
     from config import Config
 
     config_instance = Config()
-    print("✅ 成功加载配置文件")
+    print("[OK] 成功加载配置文件")
 except (ImportError, ModuleNotFoundError) as e:
-    print(f"⚠️ 配置文件导入失败: {e}")
+    print(f"[WARN] 配置文件导入失败: {e}")
 
 
     # 创建默认配置
@@ -983,9 +993,9 @@ try:
     from search.search_engine import smart_search, search_drama_by_name, batch_search_dramas
     from watchlist.manager import manage_watchlist
 
-    print("✅ 成功加载所有模块")
+    print("[OK] 成功加载所有模块")
 except ImportError as e:
-    print(f"⚠️ 部分模块导入失败: {e}")
+    print(f"[WARN] 部分模块导入失败: {e}")
 
 
     # 创建占位函数避免崩溃
