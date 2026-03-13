@@ -45,9 +45,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 try:
     from config import Config
     config_instance = Config()
-    print("✅ 成功加载配置文件")
+    print("[OK] Loaded config")
 except (ImportError, ModuleNotFoundError) as e:
-    print(f"⚠️ 无法加载配置文件: {e}，使用默认配置")
+    print(f"[WARN] Failed to load config: {e}, using default config")
 
 
     # 创建默认配置类

@@ -1,331 +1,230 @@
-# 系统架构文档
+# 系统架构说明
 
-## 1. 系统概述
+## 1. 架构概览
 
-本项目是一个基于 Flask 的电影/剧集推荐系统后端服务，采用神经协同过滤（NCF）和文本卷积神经网络（TextCNN）算法实现智能推荐。
+当前系统是一个面向电影和剧集推荐场景的 Flask 后端，核心目标是：
 
-## 2. 技术架构
+- 提供缓存可读的推荐结果
+- 通过异步任务刷新推荐，避免前端同步阻塞
+- 为电影和剧集分别维护用户偏好和统计权重
+- 以 `NCF + TextCNN + 规则特征` 的混合方案生成推荐结果
 
-### 2.1 整体架构
+整体链路分为四层：
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                      前端应用                            │
-│                   (Vue.js / React)                      │
-└─────────────────────┬───────────────────────────────────┘
-                      │ HTTP/REST API
-┌─────────────────────▼───────────────────────────────────┐
-│                   Flask Web 服务                         │
-│  ┌──────────────────────────────────────────────────┐  │
-│  │              API 路由层                           │  │
-│  │  movies | series | recommendations | search      │  │
-│  └──────────────────┬───────────────────────────────┘  │
-│  ┌──────────────────▼───────────────────────────────┐  │
-│  │              业务逻辑层                           │  │
-│  │  推荐引擎 | 搜索引擎 | 用户管理 | 清单管理       │  │
-│  └──────────────────┬───────────────────────────────┘  │
-│  ┌──────────────────▼───────────────────────────────┐  │
-│  │              数据访问层                           │  │
-│  │  CSV 读取 | JSON 存储 | 缓存管理                 │  │
-│  └──────────────────────────────────────────────────┘  │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-┌─────────────────────▼───────────────────────────────────┐
-│                   数据存储层                             │
-│  CSV 数据集 | JSON 文件 | 图片缓存 | 日志文件          │
-└─────────────────────────────────────────────────────────┘
-```
+1. 接口层：Flask 路由，接收小程序请求
+2. 业务层：推荐、搜索、想看清单、负反馈处理
+3. 模型层：NCF、TextCNN、规则内容相似度、多样性重排
+4. 存储层：CSV 数据集、用户 JSON、推荐结果 JSON
 
-### 2.2 模块划分
+## 2. 主要模块
 
-#### API 路由层 (`api/`)
-- **movies.py**: 电影相关 API
-- **series.py**: 剧集相关 API
-- **recommendations.py**: 推荐相关 API
-- **search.py**: 搜索 API
-- **watchlist.py**: 想看清单 API
-- **system.py**: 系统信息 API
+### 2.1 接口层
 
-#### 业务逻辑层
-- **recommendation/**: 推荐引擎模块
-  - `engine.py`: 推荐引擎核心
-  - `ncf_model.py`: 神经协同过滤模型
-  - `textcnn_model.py`: 文本卷积神经网络模型
-  - `similarity.py`: 相似度计算
-  - `diversity.py`: 多样性优化
+入口文件：
+- [app.py](/d:/pythonProjectmovie，tobacco/movie_recommendation/app.py)
 
-- **search/**: 搜索引擎模块
-  - `search_engine.py`: 搜索引擎实现
+主要职责：
+- 读取缓存推荐
+- 创建异步刷新任务
+- 查询刷新任务状态
+- 同步用户偏好和行为数据
+- 提供搜索、想看清单、负反馈等接口
 
-- **data/**: 数据管理模块
-  - `dataset_loader.py`: 数据集加载
-  - `user_manager.py`: 用户数据管理
+### 2.2 推荐引擎
 
-- **watchlist/**: 想看清单模块
-  - `manager.py`: 清单管理
+核心文件：
+- [engine.py](/d:/pythonProjectmovie，tobacco/movie_recommendation/recommendation/engine.py)
 
-#### 工具层 (`utils/`)
-- `file_utils.py`: 文件操作工具
-- `image_utils.py`: 图片处理工具
-- `text_utils.py`: 文本处理工具
+主要职责：
+- 初始化和修复用户数据结构
+- 将偏好按 `movie/series` 分桶
+- 计算类型权重 `count_weights`
+- 调用 NCF 和 TextCNN 计算推荐分数
+- 进行负反馈惩罚和多样性重排
+- 输出并缓存推荐结果
 
-## 3. 推荐算法
+### 2.3 模型层
 
-### 3.1 神经协同过滤 (NCF)
+相关文件：
+- [NeuralCollaborativeFiltering.py](/d:/pythonProjectmovie，tobacco/movie_recommendation/NeuralCollaborativeFiltering.py)
+- [TextCNN.py](/d:/pythonProjectmovie，tobacco/movie_recommendation/TextCNN.py)
+- [similarity.py](/d:/pythonProjectmovie，tobacco/movie_recommendation/recommendation/similarity.py)
+- [diversity.py](/d:/pythonProjectmovie，tobacco/movie_recommendation/recommendation/diversity.py)
 
-NCF 通过神经网络学习用户和项目的隐式特征表示，捕捉复杂的非线性交互关系。
+职责划分：
+- `NCF`：学习用户与项目的隐式交互偏好
+- `TextCNN`：从标题、类型、导演、演员、简介等文本中提取语义特征
+- `similarity.py`：当 TextCNN 不可用时，提供规则内容相似度
+- `diversity.py`：防止推荐结果过度集中在同一类型
 
-**核心思想**：
-1. 用户和项目分别映射到低维嵌入空间
-2. 通过多层神经网络学习交互模式
-3. 输出用户对项目的偏好分数
+## 3. 推荐架构
 
-**优势**：
-- 能够捕捉非线性关系
-- 自动学习特征表示
-- 适合大规模数据
+### 3.1 主链路
 
-### 3.2 文本卷积神经网络 (TextCNN)
+当前主链路是并行融合，而不是二选一：
 
-TextCNN 用于提取电影/剧集的文本特征（标题、简介、类型等）。
-
-**核心思想**：
-1. 将文本转换为词向量序列
-2. 使用多尺度卷积核提取局部特征
-3. 通过池化层获得固定长度的特征向量
-
-**优势**：
-- 能够捕捉文本的局部模式
-- 计算效率高
-- 适合短文本处理
-
-### 3.3 混合推荐策略
-
-系统采用混合推荐策略，综合多种因素：
-
-```python
-final_score = w1 * ncf_score + 
-              w2 * textcnn_score + 
-              w3 * genre_preference + 
-              w4 * rating + 
-              w5 * popularity + 
-              w6 * diversity
+```text
+NCF score
+    \
+     +--> final_score --> sort --> diversity re-rank --> cache
+    /
+TextCNN score
+    +
+rule features
 ```
 
-**权重配置**：
-- 类型偏好权重: 0.7
-- 评分权重: 0.1
-- 流行度权重: 0.02
-- 年份权重: 0.03
-- 相似度权重: 0.05
-- 用户偏好权重: 0.1
+最终分数：
 
-## 4. 数据流
-
-### 4.1 推荐生成流程
-
-```
-用户偏好数据
-    │
-    ▼
-计算类型权重
-    │
-    ▼
-加载数据集 ──────┐
-    │            │
-    ▼            ▼
-NCF 模型     TextCNN 模型
-    │            │
-    └────┬───────┘
-         ▼
-    特征融合
-         │
-         ▼
-    排序 & 过滤
-         │
-         ▼
-    多样性优化
-         │
-         ▼
-    生成推荐列表
-         │
-         ▼
-    缓存到 JSON
+```text
+final_score =
+0.35 * ncf_score +
+0.30 * textcnn_score +
+0.20 * genre_score +
+0.10 * quality_score +
+0.05 * diversity_score
 ```
 
-### 4.2 搜索流程
+附加处理：
+- 负反馈惩罚
+- 黑名单过滤
+- 多样性重排
 
-```
-用户输入关键词
-    │
-    ▼
-分词 & 预处理
-    │
-    ▼
-计算相似度 ──────┐
-    │            │
-    ├─ 标题匹配  │
-    ├─ 类型匹配  │
-    └─ 演员匹配  │
-         │       │
-         └───┬───┘
-             ▼
-        结果排序
-             │
-             ▼
-        返回结果
-```
+### 3.2 降级链路
 
-## 5. 数据模型
+系统保留平滑降级策略：
 
-### 5.1 用户数据 (user_data.json)
+1. `NCF + TextCNN + 规则分`
+2. `NCF + 规则内容相似度 + 规则分`
+3. `TextCNN + 规则分`
+4. `规则内容推荐 + 多样性重排`
+
+含义是：
+- `TextCNN` 不可用时，退回到手工内容相似度
+- `NCF` 不可用时，仍可基于文本和规则继续推荐
+- 两者都不可用时，系统仍能输出可用结果
+
+## 4. 用户数据结构
+
+用户数据文件：
+- [user_data.json](/d:/pythonProjectmovie，tobacco/data/user/user_data.json)
+
+当前采用按内容类型分桶的结构：
 
 ```json
 {
-  "preferences": [
-    {
-      "id": "1",
-      "name": "肖申克的救赎",
-      "genres": ["剧情", "犯罪"],
-      "rating": 9.7,
-      "year": 1994
-    }
-  ],
-  "count_weights": {
-    "剧情": 0.5,
-    "犯罪": 0.5
+  "preferences": {
+    "movie": [],
+    "series": []
   },
-  "negative_feedback": [
-    {
-      "item_id": "123",
-      "type": "movie",
-      "reason": "不喜欢",
-      "timestamp": "2024-03-08 10:00:00"
+  "behavior": {
+    "movie": [],
+    "series": []
+  },
+  "count_weights": {
+    "movie": {
+      "genres": {},
+      "directors": {},
+      "actors": {}
+    },
+    "series": {
+      "genres": {},
+      "directors": {},
+      "actors": {}
     }
-  ],
-  "last_updated": "2024-03-08 10:30:00"
+  }
 }
 ```
 
-### 5.2 推荐结果 (movie_recommendations.json)
+这样可以保证：
+- 电影推荐只使用电影偏好
+- 剧集推荐只使用剧集偏好
+- 不再出现剧集沿用电影统计权重的问题
 
-```json
-{
-  "data": [
-    {
-      "id": "1",
-      "title": "肖申克的救赎",
-      "rating": "9.7",
-      "score": 0.95,
-      "reason": "基于您喜欢的剧情类电影"
-    }
-  ],
-  "generated_time": "2024-03-08 10:30:00",
-  "algorithm_version": "NCF+TextCNN_v1.0",
-  "count": 20
-}
-```
+## 5. 刷新架构
 
-### 5.3 想看清单 (watchlist.json)
+### 5.1 设计目标
 
-```json
-{
-  "movie": [
-    {
-      "id": "1",
-      "title": "肖申克的救赎",
-      "added_time": "2024-03-08 10:00:00",
-      "data": { /* 完整电影信息 */ }
-    }
-  ],
-  "series": []
-}
-```
+旧实现的问题是：
+- `GET /get_recommend` 既负责读取结果，也可能同步跑模型
+- 前端刷新必须等待模型训练和推理完成
+- 当推荐生成耗时增加时，小程序容易超时
 
-## 6. 性能优化
+当前实现将“读取推荐”和“刷新推荐”拆开。
 
-### 6.1 缓存策略
+### 5.2 当前接口职责
 
-- **推荐结果缓存**: 5 分钟有效期
-- **图片缓存**: 本地文件缓存，1 天有效期
-- **数据集缓存**: 内存缓存，应用启动时加载
+- `GET /get_recommend`
+  - 只读取缓存推荐 JSON
+  - 快速返回当前可用结果
 
-### 6.2 异步处理
+- `POST /refresh-recommendations`
+  - 创建后台刷新任务
+  - 返回 `job_id`
 
-- 推荐生成可以异步执行
-- 图片下载使用连接池
-- 批量查询并行处理
+- `GET /refresh-status`
+  - 查询任务状态
+  - 支持 `queued`、`running`、`done`、`failed`
 
-### 6.3 数据库优化（未来）
+### 5.3 后台任务模型
 
-- 考虑使用 Redis 缓存热点数据
-- 使用 PostgreSQL 存储用户数据
-- 使用 Elasticsearch 优化搜索
+当前使用轻量级后台线程执行刷新任务：
 
-## 7. 安全性
+1. 前端发起刷新
+2. 后端生成 `job_id`
+3. 后台线程调用推荐引擎重新生成并写入缓存
+4. 前端轮询任务状态
+5. 刷新完成后重新读取缓存推荐
 
-### 7.1 输入验证
+这套设计的优点是：
+- 前端不再同步阻塞
+- 模型执行时间对页面稳定性影响更小
+- 接口语义更清晰
 
-- 所有用户输入进行验证和清理
-- 防止 SQL 注入（如果使用数据库）
-- 防止 XSS 攻击
+## 6. 前端联动
 
-### 7.2 访问控制
+相关页面：
+- [movieRecommend.js](/d:/pythonProjectmovie，tobacco/微信小程序/pages/movieRecommend/movieRecommend.js)
+- [showRecommend.js](/d:/pythonProjectmovie，tobacco/微信小程序/pages/showRecommend/showRecommend.js)
 
-- 图片代理仅允许白名单域名
-- API 限流（未来实现）
-- 用户认证（未来实现）
+当前刷新逻辑：
 
-### 7.3 数据保护
+1. 页面进入时调用 `GET /get_recommend`
+2. 点击刷新后调用 `POST /refresh-recommendations`
+3. 保存 `job_id`
+4. 轮询 `GET /refresh-status`
+5. 状态变为 `done` 后再次调用 `GET /get_recommend`
+6. 直接覆盖当前列表
 
-- 敏感配置使用环境变量
-- 日志脱敏处理
-- HTTPS 传输（生产环境）
+因此：
+- 电影页刷新后会在当前页直接更新
+- 剧集页刷新后也会在当前页直接更新
+- 不需要退出后再重新进入页面
 
-## 8. 可扩展性
+## 7. 存储结构
 
-### 8.1 水平扩展
+主要数据文件：
 
-- 无状态设计，支持多实例部署
-- 使用负载均衡器分发请求
-- 共享缓存和存储
+- 数据集
+  - [douban_movies.csv](/d:/pythonProjectmovie，tobacco/data/datasets/douban_movies.csv)
+  - [douban_series.csv](/d:/pythonProjectmovie，tobacco/data/datasets/douban_series.csv)
+- 用户数据
+  - [user_data.json](/d:/pythonProjectmovie，tobacco/data/user/user_data.json)
+- 推荐缓存
+  - [movie_recommendations.json](/d:/pythonProjectmovie，tobacco/data/recommendations/movie_recommendations.json)
+  - [series_recommendations.json](/d:/pythonProjectmovie，tobacco/data/recommendations/series_recommendations.json)
 
-### 8.2 垂直扩展
+推荐结果是缓存产物，供前端直接读取；刷新任务负责更新这些缓存文件。
 
-- 模型训练可以使用 GPU
-- 数据处理可以使用多进程
-- 缓存可以增加内存
+## 8. 当前约束与后续方向
 
-### 8.3 功能扩展
+当前实现已经完成：
+- 混合推荐主链路
+- 异步刷新
+- 电影/剧集偏好分桶
+- 小程序当前页即时更新
 
-- 支持更多推荐算法
-- 支持实时推荐
-- 支持 A/B 测试
-- 支持推荐解释
-
-## 9. 监控与日志
-
-### 9.1 日志级别
-
-- **DEBUG**: 详细的调试信息
-- **INFO**: 一般信息
-- **WARNING**: 警告信息
-- **ERROR**: 错误信息
-- **CRITICAL**: 严重错误
-
-### 9.2 监控指标
-
-- API 响应时间
-- 推荐生成时间
-- 缓存命中率
-- 错误率
-- 并发用户数
-
-## 10. 未来规划
-
-1. **用户系统**: 实现用户注册、登录、权限管理
-2. **实时推荐**: 基于用户实时行为的推荐
-3. **社交功能**: 好友推荐、评论、评分
-4. **移动端**: 开发移动端 API
-5. **大数据**: 使用 Spark 处理大规模数据
-6. **深度学习**: 引入更先进的深度学习模型
+后续仍可继续优化：
+- 将后台线程替换为更稳定的任务队列
+- 为 TextCNN item embedding 增加持久化缓存
+- 为 NCF 和 TextCNN 增加离线训练与模型复用
+- 补充 `compare.py` 对新主链路的离线评估

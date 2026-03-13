@@ -923,6 +923,8 @@ import os
 import traceback
 import random
 import sys
+import threading
+import uuid
 from datetime import datetime
 from flask import Flask, jsonify, request, make_response, send_file
 import pandas as pd
@@ -987,9 +989,18 @@ try:
     from utils.file_utils import safe_read_json, safe_write_json
     from utils.image_utils import proxy_image, is_allowed_domain
     from utils.text_utils import calculate_similarity
-    from data.dataset_loader import load_dataset, safe_read_csv
-    from data.user_manager import init_or_repair_user_data, calculate_count_weights, add_negative_feedback
-    from recommendation.engine import generate_and_save_recommendations, generate_personalized_recommendations
+    from recommendation.engine import (
+        add_negative_feedback,
+        calculate_preference_weights,
+        generate_and_save_recommendations,
+        generate_personalized_recommendations,
+        get_behavior_for_type,
+        get_count_weights_for_type,
+        get_preferences_for_type,
+        init_or_repair_user_data,
+        normalize_preferences_payload,
+        safe_read_csv,
+    )
     from search.search_engine import smart_search, search_drama_by_name, batch_search_dramas
     from watchlist.manager import manage_watchlist
 
@@ -1021,6 +1032,61 @@ CORS(app, resources={r"/*": {"origins": "*"}})  # 更宽松的CORS配置
 
 # 全局配置引用
 Config = config_instance
+refresh_jobs = {}
+refresh_jobs_lock = threading.Lock()
+
+
+def build_refresh_job(recommend_type):
+    """Create an in-memory refresh job and return its id."""
+    job_id = f"{recommend_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    with refresh_jobs_lock:
+        refresh_jobs[job_id] = {
+            "job_id": job_id,
+            "type": recommend_type,
+            "status": "queued",
+            "error": "",
+            "created_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "started_at": "",
+            "finished_at": "",
+        }
+    return job_id
+
+
+def run_refresh_job(job_id, recommend_type):
+    """Execute recommendation refresh in a background thread."""
+    with refresh_jobs_lock:
+        job = refresh_jobs.get(job_id)
+        if not job:
+            return
+        job["status"] = "running"
+        job["started_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    try:
+        ok = generate_and_save_recommendations(recommend_type, force_refresh=True)
+        with refresh_jobs_lock:
+            job = refresh_jobs.get(job_id)
+            if not job:
+                return
+            job["status"] = "done" if ok else "failed"
+            if not ok:
+                job["error"] = "refresh_failed"
+            job["finished_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    except Exception as exc:
+        with refresh_jobs_lock:
+            job = refresh_jobs.get(job_id)
+            if not job:
+                return
+            job["status"] = "failed"
+            job["error"] = str(exc)
+            job["finished_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def start_refresh_job(recommend_type):
+    """Start a refresh thread for one content type."""
+    job_id = build_refresh_job(recommend_type)
+    thread = threading.Thread(target=run_refresh_job, args=(job_id, recommend_type), daemon=True)
+    thread.start()
+    return job_id
 
 
 # --------------------------
@@ -1511,6 +1577,137 @@ def refresh_recommendations():
         print(f"刷新推荐失败: {str(e)}")
         traceback.print_exc()
         return jsonify({"code": 500, "error": f"服务器错误: {str(e)}"}), 500
+
+
+@app.route("/refresh-status", methods=["GET"])
+def refresh_status():
+    try:
+        job_id = request.args.get('job_id', '').strip()
+        if not job_id:
+            return jsonify({"code": 400, "error": "missing_job_id"}), 400
+
+        with refresh_jobs_lock:
+            job = refresh_jobs.get(job_id)
+            if not job:
+                return jsonify({"code": 404, "error": "job_not_found"}), 404
+            return jsonify({"code": 0, **job})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"code": 500, "error": str(e)}), 500
+
+
+def sync_user_data_v2():
+    """Persist typed preferences and trigger background refresh jobs."""
+    try:
+        data = request.get_json(force=True)
+        if not isinstance(data, dict) or 'preferences' not in data:
+            return jsonify({"code": 400, "error": "missing_preferences"}), 400
+
+        normalized_preferences = normalize_preferences_payload(data.get('preferences', []))
+        total_preferences = len(normalized_preferences['movie']) + len(normalized_preferences['series'])
+        if total_preferences == 0:
+            return jsonify({"code": 400, "error": "no_valid_preferences"}), 400
+
+        user_data = init_or_repair_user_data()
+        old_weights = user_data.get('count_weights', {})
+        new_weights = {
+            'movie': calculate_preference_weights(normalized_preferences['movie']),
+            'series': calculate_preference_weights(normalized_preferences['series']),
+        }
+        user_data['preferences'] = normalized_preferences
+        user_data['count_weights'] = new_weights
+        user_data['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        if not safe_write_json(Config.USER_DATA_FILE, user_data):
+            return jsonify({"code": 500, "error": "failed_to_write_user_data"}), 500
+
+        jobs = {}
+        if old_weights != new_weights:
+            jobs['movie'] = start_refresh_job('movie')
+            jobs['series'] = start_refresh_job('series')
+
+        return jsonify({
+            "code": 0,
+            "message": "sync_success",
+            "count_weights": new_weights,
+            "saved_preferences_count": total_preferences,
+            "updated_recommendations": bool(jobs),
+            "jobs": jobs,
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"code": 500, "error": str(e)}), 500
+
+
+def get_recommend_v2():
+    """Return cached recommendation results without synchronous regeneration."""
+    try:
+        recommend_type = request.args.get('type', 'movie').lower()
+        if recommend_type not in ('movie', 'series'):
+            recommend_type = 'movie'
+
+        recommend_data = safe_read_json(Config.RECOMMEND_OUTPUT_PATH[recommend_type], {})
+        recommendations = recommend_data.get("data", [])
+        if not recommendations:
+            csv_path = Config.DATASET_PATHS.get(recommend_type)
+            if csv_path and os.path.exists(csv_path):
+                df = safe_read_csv(csv_path)
+                if not df.empty:
+                    recommendations = df.sample(frac=1).reset_index(drop=True).head(10).to_dict('records')
+
+        user_data = init_or_repair_user_data()
+        return jsonify({
+            "code": 0,
+            "data": recommendations,
+            "count_weights": get_count_weights_for_type(user_data, recommend_type),
+            "generated_time": recommend_data.get('generated_time', ''),
+            "refreshed": False,
+            "algorithm_version": recommend_data.get('algorithm_version', "NCF_TextCNN_v3.0")
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"code": 500, "error": str(e)}), 500
+
+
+def refresh_recommendations_v2():
+    """Queue recommendation refresh jobs and return immediately."""
+    try:
+        if request.method == 'POST':
+            data = request.get_json() or {}
+        else:
+            data = request.args
+
+        content_type = str(data.get('type', '')).strip().lower()
+        if content_type and content_type not in ('movie', 'series'):
+            return jsonify({"code": 400, "error": "invalid_type"}), 400
+
+        if content_type:
+            job_id = start_refresh_job(content_type)
+            return jsonify({
+                "code": 0,
+                "message": "refresh_queued",
+                "type": content_type,
+                "job_id": job_id,
+                "status": "queued",
+                "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            })
+
+        jobs = {'movie': start_refresh_job('movie'), 'series': start_refresh_job('series')}
+        return jsonify({
+            "code": 0,
+            "message": "refresh_queued",
+            "type": "all",
+            "jobs": jobs,
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"code": 500, "error": str(e)}), 500
+
+
+app.view_functions['sync_user_data'] = sync_user_data_v2
+app.view_functions['get_recommend'] = get_recommend_v2
+app.view_functions['refresh_recommendations'] = refresh_recommendations_v2
 
 
 @app.route("/proxy-image", methods=["GET"])

@@ -240,9 +240,9 @@ sys.path.insert(0, config_dir)
 print(f"正在查找config.py于: {config_dir}")
 config_file = os.path.join(config_dir, 'config.py')
 if os.path.exists(config_file):
-    print(f"✅ 找到config.py: {config_file}")
+    print(f"[OK] Found config.py: {config_file}")
 else:
-    print(f"❌ 未找到config.py: {config_file}")
+    print(f"[ERR] Missing config.py: {config_file}")
     # 列出目录内容帮助排查
     try:
         print("目录内容:")
@@ -255,9 +255,9 @@ else:
 try:
     from config import Config
     
-    print("✅ 成功导入config模块")
+    print("[OK] Imported config module")
 except ImportError as e:
-    print(f"⚠️ 导入config失败，使用内置配置: {e}")
+    print(f"[WARN] Failed to import config, using builtin fallback: {e}")
 
 
     # 内置Config类作为备选
@@ -313,7 +313,16 @@ try:
     NCF_AVAILABLE = True
 except ImportError:
     NCF_AVAILABLE = False
-    print("⚠️ TensorFlow/Keras未安装，将使用基于内容的推荐方案")
+    print("[WARN] TensorFlow/Keras unavailable, using content-based fallback")
+
+
+try:
+    from TextCNN import TextCNN
+
+    TEXTCNN_AVAILABLE = True
+except ImportError:
+    TEXTCNN_AVAILABLE = False
+    print("TextCNN unavailable, fallback to rule-based content similarity.")
 
 
 class NCFRecommender:
@@ -488,7 +497,7 @@ def load_dataset(recommend_type):
                 df = pd.DataFrame()
 
         if not df.empty:
-            print(f"✅ 成功加载{len(df)}条数据")
+            print(f"[OK] Loaded {len(df)} rows")
             # 确保id列存在
             if 'id' not in df.columns:
                 if 'movie_id' in df.columns:
@@ -499,7 +508,7 @@ def load_dataset(recommend_type):
                     df['id'] = range(len(df))
             return df
     else:
-        print(f"❌ 数据集文件不存在: {file_path}")
+        print(f"[ERR] Dataset file missing: {file_path}")
 
     # 降级加载推荐结果文件
     file_path = Config.RECOMMEND_OUTPUT_PATH.get(recommend_type)
@@ -543,12 +552,12 @@ def init_or_repair_user_data():
         with open(user_data_path, 'r', encoding='utf-8') as f:
             try:
                 user_data = json.load(f)
-                print(f"✅ 成功加载用户数据，偏好数量: {len(user_data.get('preferences', []))}")
+                print(f"[OK] Loaded user data, preferences: {len(user_data.get('preferences', []))}")
             except Exception as e:
                 print(f"读取用户数据失败: {e}")
                 user_data = {}
     else:
-        print(f"❌ 用户数据文件不存在，创建新数据")
+        print("[ERR] User data file missing, creating a new one")
         user_data = {}
 
     # 确保必要的字段存在
@@ -625,6 +634,100 @@ def calculate_content_similarity(row, user_data):
     return similarity_score / max(match_count, 1)
 
 
+def build_item_text(record):
+    """Build a compact text field for TextCNN encoding."""
+    fields = [
+        str(record.get('title', '')).strip(),
+        str(record.get('genres', '')).strip(),
+        str(record.get('director', '')).strip(),
+        str(record.get('actors', '')).strip(),
+        str(record.get('plot', '')).strip(),
+    ]
+    return ' '.join(part for part in fields if part and part.lower() != 'nan')
+
+
+def normalize_score_map(score_map):
+    """Scale scores into [0, 1] while preserving relative ranking."""
+    if not score_map:
+        return {}
+
+    values = np.array(list(score_map.values()), dtype=float)
+    min_value = float(values.min())
+    max_value = float(values.max())
+    if max_value - min_value < 1e-8:
+        return {key: 1.0 for key in score_map}
+
+    return {
+        key: float((value - min_value) / (max_value - min_value))
+        for key, value in score_map.items()
+    }
+
+
+def cosine_score(vector_a, vector_b):
+    """Return cosine similarity normalized into [0, 1]."""
+    a = np.asarray(vector_a, dtype=float)
+    b = np.asarray(vector_b, dtype=float)
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom <= 1e-8:
+        return 0.0
+
+    score = float(np.dot(a, b) / denom)
+    return max(0.0, min(1.0, (score + 1.0) / 2.0))
+
+
+def build_textcnn_scores(items_df, user_preferences):
+    """Encode item texts and user history, then score candidates by cosine similarity."""
+    if not TEXTCNN_AVAILABLE or items_df.empty or not user_preferences:
+        return None
+
+    preference_texts = [build_item_text(pref) for pref in user_preferences]
+    preference_texts = [text for text in preference_texts if text]
+    item_texts = [build_item_text(row) for _, row in items_df.iterrows()]
+    item_texts = [text for text in item_texts if text]
+    training_texts = list(dict.fromkeys(preference_texts + item_texts))
+    if not training_texts:
+        return None
+
+    try:
+        encoder = TextCNN()
+        encoder.fit(training_texts)
+    except Exception as exc:
+        print(f"TextCNN initialization failed: {exc}")
+        return None
+
+    weighted_vectors = []
+    for pref in user_preferences:
+        text = build_item_text(pref)
+        if not text:
+            continue
+        try:
+            vector = encoder.extract_features(text)
+        except Exception:
+            continue
+        weight = max(1.0, float(pref.get('rating', 0) or 0) / 5.0)
+        weighted_vectors.append((np.asarray(vector, dtype=float), weight))
+
+    if not weighted_vectors:
+        return None
+
+    total_weight = sum(weight for _, weight in weighted_vectors)
+    user_vector = sum(vector * weight for vector, weight in weighted_vectors) / max(total_weight, 1e-8)
+
+    raw_scores = {}
+    for _, row in items_df.iterrows():
+        item_id = str(row.get('id', ''))
+        text = build_item_text(row)
+        if not item_id or not text:
+            continue
+        try:
+            item_vector = encoder.extract_features(text)
+        except Exception:
+            continue
+        raw_scores[item_id] = cosine_score(user_vector, item_vector)
+
+    return normalize_score_map(raw_scores) if raw_scores else None
+
+
 def apply_diversity_strategy(df):
     """应用多样性策略（增强版）"""
     max_recs = Config.MAX_RECOMMENDATIONS
@@ -692,10 +795,10 @@ def safe_write_json(file_path, data):
 
         with open(file_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"✅ 成功写入JSON: {file_path}")
+        print(f"[OK] Wrote JSON: {file_path}")
         return True
     except Exception as e:
-        print(f"❌ 写入JSON失败: {e}")
+        print(f"[ERR] Failed to write JSON: {e}")
         return False
 
 
@@ -749,6 +852,61 @@ def calculate_item_score(row, preference_weights, user_data, ncf_scores=None):
     score *= random.uniform(0.98, 1.02)
 
     return score
+
+
+def calculate_item_score(row, preference_weights, user_data, ncf_scores=None, textcnn_scores=None):
+    """Blend NCF, TextCNN and rule-based signals with graceful fallback."""
+    item_id = str(row.get('id', ''))
+    weighted_score = 0.0
+    active_weight = 0.0
+
+    ncf_weight = 0.35
+    text_weight = 0.30
+    genre_weight = 0.20
+    quality_weight = 0.10
+    diversity_weight = 0.05
+
+    if ncf_scores and item_id in ncf_scores:
+        weighted_score += ncf_scores[item_id] * ncf_weight
+        active_weight += ncf_weight
+
+    if textcnn_scores and item_id in textcnn_scores:
+        weighted_score += textcnn_scores[item_id] * text_weight
+        active_weight += text_weight
+    else:
+        fallback_content = calculate_content_similarity(row, user_data)
+        weighted_score += fallback_content * text_weight
+        active_weight += text_weight
+
+    genre_score = 0.0
+    genres = str(row.get('genres', '')).split(',')
+    for genre in genres:
+        genre = genre.strip()
+        genre_score += preference_weights['genres'].get(genre, 0.0)
+
+    max_genre_score = len([g for g in genres if g.strip()])
+    if max_genre_score > 0:
+        genre_score = min(genre_score / max_genre_score, 1.0)
+    weighted_score += genre_score * genre_weight
+    active_weight += genre_weight
+
+    rating_score = min(float(row.get('rating', 0)) / 10, 1.0)
+    year_score = max(0, 1 - (datetime.now().year - int(row.get('year', 0))) / 20) if row.get('year') else 0.5
+    quality_score = rating_score * 0.7 + year_score * 0.3
+    weighted_score += quality_score * quality_weight
+    active_weight += quality_weight
+
+    diversity_score = row.get('diversity_score', 0.5)
+    weighted_score += diversity_score * diversity_weight
+    active_weight += diversity_weight
+
+    score = weighted_score / max(active_weight, 1e-8)
+
+    if item_id in [item['id'] for item in user_data.get('disliked_items', [])]:
+        score *= Config.NEGATIVE_FEEDBACK_PENALTY
+
+    score *= random.uniform(0.98, 1.02)
+    return float(score)
 
 
 def calculate_diversity_score(row, items_df):
@@ -871,6 +1029,468 @@ def generate_and_save_recommendations(recommend_type, force_refresh=False):
 
 
 # 新增：强制刷新函数
+def generate_personalized_recommendations(recommend_type):
+    """Generate recommendations with NCF + TextCNN + rule fusion."""
+    random.seed(datetime.now().timestamp())
+    print(f"\nGenerating {recommend_type} recommendations...")
+
+    items_df = load_dataset(recommend_type)
+    if items_df.empty:
+        print("Dataset is empty.")
+        return [{"id": "0", "title": f"{recommend_type} dataset is empty", "genres": "", "rating": 0, "cover_url": ""}]
+
+    items_df = preprocess_dataset(items_df)
+
+    user_data = init_or_repair_user_data()
+    user_preferences = user_data.get('preferences', [])
+    user_behavior = user_data.get('behavior', [])
+
+    blacklist = [item['item_id'] for item in user_data.get('blacklist', []) if item.get('item_type') == recommend_type]
+    if blacklist:
+        items_df = items_df[~items_df['id'].isin(blacklist)]
+        print(f"Applied blacklist, remaining items: {len(items_df)}")
+
+    ncf_scores = None
+    if NCF_AVAILABLE:
+        try:
+            ncf_recommender = NCFRecommender()
+            if ncf_recommender.train(items_df, user_preferences, user_behavior):
+                ncf_scores = normalize_score_map(ncf_recommender.predict_scores(items_df))
+                print(f"NCF scores ready for {len(user_preferences)} preferences")
+        except Exception as exc:
+            print(f"NCF training failed: {exc}")
+
+    textcnn_scores = build_textcnn_scores(items_df, user_preferences)
+    if textcnn_scores:
+        print(f"TextCNN scores ready for {len(user_preferences)} preferences")
+    else:
+        print("TextCNN unavailable, using rule-based content fallback")
+
+    items_df['diversity_score'] = items_df.apply(
+        lambda row: calculate_diversity_score(row, items_df),
+        axis=1
+    )
+
+    preference_weights = calculate_preference_weights(user_preferences)
+    items_df['final_score'] = items_df.apply(
+        lambda row: calculate_item_score(row, preference_weights, user_data, ncf_scores, textcnn_scores),
+        axis=1
+    )
+
+    items_df = items_df.sort_values('final_score', ascending=False)
+    items_df['final_score'] = items_df['final_score'] * np.random.uniform(0.98, 1.02, size=len(items_df))
+    items_df = items_df.sort_values('final_score', ascending=False)
+
+    final_result = apply_diversity_strategy(items_df)
+    if len(final_result) > 5:
+        top5 = final_result.head(5)
+        rest = final_result.iloc[5:].sample(frac=1, random_state=int(datetime.now().timestamp()))
+        final_result = pd.concat([top5, rest])
+
+    print(f"Generated {len(final_result)} recommendations.")
+    return final_result.head(Config.MAX_RECOMMENDATIONS).to_dict('records')
+
+
+def generate_and_save_recommendations(recommend_type, force_refresh=False):
+    """Generate and persist recommendations for the API."""
+    try:
+        recommendations = generate_personalized_recommendations(recommend_type)
+
+        user_data = init_or_repair_user_data()
+        user_data['last_refresh_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        user_data['count_weights'] = calculate_preference_weights(user_data.get('preferences', []))
+        safe_write_json(Config.USER_DATA_FILE, user_data)
+
+        output_data = {
+            "code": 0,
+            "user_id": "user_default",
+            "data": recommendations,
+            "count_weights": user_data.get('count_weights', {}).get('genres', {}),
+            "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "refreshed": True,
+            "algorithm_version": "NCF_TextCNN_v3.0",
+            "algorithm_type": "NCF + TextCNN + Rule Fusion",
+            "refresh_reason": "forced_refresh" if force_refresh else "regular_update"
+        }
+
+        output_path = Config.RECOMMEND_OUTPUT_PATH[recommend_type]
+        safe_write_json(output_path, output_data)
+        print(f"Saved {recommend_type} recommendations to {output_path}")
+        return True
+    except Exception as exc:
+        print(f"Recommendation generation failed: {exc}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def safe_read_csv(file_path):
+    """Read CSV with utf-8/gbk fallback."""
+    for encoding in ('utf-8', 'gbk'):
+        try:
+            return pd.read_csv(file_path, encoding=encoding)
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+def parse_multi_value(value):
+    """Normalize text/list fields into a clean list of strings."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    text = str(value).strip()
+    if not text:
+        return []
+
+    if text.startswith('[') and text.endswith(']'):
+        try:
+            parsed = json.loads(text.replace("'", '"'))
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except Exception:
+            pass
+
+    return [part.strip() for part in text.split(',') if part.strip() and part.strip().lower() != 'nan']
+
+
+def get_dataset_id_sets(force_reload=False):
+    """Cache dataset ids for content type inference."""
+    if force_reload or not hasattr(get_dataset_id_sets, '_cache'):
+        cache = {'movie': set(), 'series': set()}
+        for content_type in ('movie', 'series'):
+            path = Config.DATASET_PATHS.get(content_type)
+            df = safe_read_csv(path) if path and os.path.exists(path) else pd.DataFrame()
+            if not df.empty:
+                if 'id' not in df.columns:
+                    if 'movie_id' in df.columns:
+                        df = df.rename(columns={'movie_id': 'id'})
+                    elif 'drama_id' in df.columns:
+                        df = df.rename(columns={'drama_id': 'id'})
+                if 'id' in df.columns:
+                    cache[content_type] = set(df['id'].astype(str))
+        get_dataset_id_sets._cache = cache
+    return get_dataset_id_sets._cache
+
+
+def infer_content_type(item, dataset_ids=None, default_type='movie'):
+    """Infer whether an item belongs to movie or series."""
+    explicit_type = str(item.get('content_type') or item.get('type') or '').strip().lower()
+    if explicit_type in ('movie', 'series'):
+        return explicit_type
+
+    item_id = str(item.get('id', '')).strip()
+    dataset_ids = dataset_ids or get_dataset_id_sets()
+    if item_id and item_id in dataset_ids.get('movie', set()):
+        return 'movie'
+    if item_id and item_id in dataset_ids.get('series', set()):
+        return 'series'
+    return default_type
+
+
+def normalize_preference_item(item, default_type='movie', dataset_ids=None):
+    """Normalize one preference record and attach content_type."""
+    item_id = str(item.get('id', '')).strip()
+    if not item_id:
+        return None
+
+    name = str(item.get('name', '') or item.get('title', '')).strip() or item_id
+    content_type = infer_content_type(item, dataset_ids=dataset_ids, default_type=default_type)
+    return {
+        'id': item_id,
+        'name': name,
+        'title': str(item.get('title', '') or name).strip() or name,
+        'genres': parse_multi_value(item.get('genres', [])),
+        'rating': item.get('rating', 0),
+        'cover_url': item.get('cover_url', ''),
+        'year': item.get('year', 0),
+        'director': str(item.get('director', '')).strip(),
+        'actors': ', '.join(parse_multi_value(item.get('actors', []))),
+        'plot': str(item.get('plot', '')).strip(),
+        'content_type': content_type,
+    }
+
+
+def normalize_preferences_payload(preferences):
+    """Convert preference payload into movie/series buckets."""
+    dataset_ids = get_dataset_id_sets()
+    normalized = {'movie': [], 'series': []}
+
+    if isinstance(preferences, dict):
+        for content_type in ('movie', 'series'):
+            for item in preferences.get(content_type, []) or []:
+                if not isinstance(item, dict):
+                    continue
+                normalized_item = normalize_preference_item(item, default_type=content_type, dataset_ids=dataset_ids)
+                if normalized_item:
+                    normalized[content_type].append(normalized_item)
+        return normalized
+
+    if isinstance(preferences, list):
+        for item in preferences:
+            if not isinstance(item, dict):
+                continue
+            normalized_item = normalize_preference_item(item, dataset_ids=dataset_ids)
+            if normalized_item:
+                normalized[normalized_item['content_type']].append(normalized_item)
+
+    return normalized
+
+
+def normalize_behavior_payload(behavior):
+    """Convert behavior payload into movie/series buckets."""
+    dataset_ids = get_dataset_id_sets()
+    normalized = {'movie': [], 'series': []}
+
+    if isinstance(behavior, dict):
+        for content_type in ('movie', 'series'):
+            for event in behavior.get(content_type, []) or []:
+                if not isinstance(event, dict):
+                    continue
+                item_type = infer_content_type(event, dataset_ids=dataset_ids, default_type=content_type)
+                event_copy = dict(event)
+                event_copy['item_type'] = item_type
+                normalized[item_type].append(event_copy)
+        return normalized
+
+    if isinstance(behavior, list):
+        for event in behavior:
+            if not isinstance(event, dict):
+                continue
+            item_type = infer_content_type({'id': event.get('item_id', ''), **event}, dataset_ids=dataset_ids)
+            event_copy = dict(event)
+            event_copy['item_type'] = item_type
+            normalized[item_type].append(event_copy)
+    return normalized
+
+
+def ensure_count_weight_buckets(count_weights):
+    """Ensure movie/series weight buckets exist."""
+    empty_weights = {'genres': {}, 'directors': {}, 'actors': {}}
+    if isinstance(count_weights, dict) and 'movie' in count_weights and 'series' in count_weights:
+        count_weights.setdefault('movie', json.loads(json.dumps(empty_weights)))
+        count_weights.setdefault('series', json.loads(json.dumps(empty_weights)))
+        return count_weights
+
+    return {
+        'movie': json.loads(json.dumps(empty_weights)),
+        'series': json.loads(json.dumps(empty_weights)),
+    }
+
+
+def get_preferences_for_type(user_data, recommend_type):
+    preferences = normalize_preferences_payload(user_data.get('preferences', {}))
+    return preferences.get(recommend_type, [])
+
+
+def get_behavior_for_type(user_data, recommend_type):
+    behavior = normalize_behavior_payload(user_data.get('behavior', {}))
+    return behavior.get(recommend_type, [])
+
+
+def get_count_weights_for_type(user_data, recommend_type):
+    count_weights = ensure_count_weight_buckets(user_data.get('count_weights', {}))
+    return count_weights.get(recommend_type, {'genres': {}, 'directors': {}, 'actors': {}})
+
+
+def init_or_repair_user_data():
+    """Initialize user data and migrate legacy flat preference structures."""
+    user_data_path = Config.USER_DATA_FILE
+    print(f"加载用户数据: {user_data_path}")
+
+    if os.path.exists(user_data_path):
+        with open(user_data_path, 'r', encoding='utf-8') as f:
+            try:
+                user_data = json.load(f)
+            except Exception as exc:
+                print(f"读取用户数据失败: {exc}")
+                user_data = {}
+    else:
+        print("[ERR] User data file missing, creating a new one")
+        user_data = {}
+
+    normalized_preferences = normalize_preferences_payload(user_data.get('preferences', {}))
+    normalized_behavior = normalize_behavior_payload(user_data.get('behavior', {}))
+    count_weights = ensure_count_weight_buckets(user_data.get('count_weights', {}))
+
+    count_weights['movie'] = calculate_preference_weights(normalized_preferences['movie'])
+    count_weights['series'] = calculate_preference_weights(normalized_preferences['series'])
+
+    user_data['preferences'] = normalized_preferences
+    user_data['behavior'] = normalized_behavior
+    user_data.setdefault('blacklist', [])
+    user_data.setdefault('disliked_items', [])
+    user_data['count_weights'] = count_weights
+    user_data.setdefault('last_refresh_time', '')
+    user_data.setdefault('last_updated', '')
+
+    print(
+        f"[OK] Loaded user data, movie preferences: {len(normalized_preferences['movie'])}, "
+        f"series preferences: {len(normalized_preferences['series'])}"
+    )
+    return user_data
+
+
+def calculate_preference_weights(user_preferences):
+    """Count genre/director/actor preferences from normalized preference items."""
+    weights = {'genres': {}, 'directors': {}, 'actors': {}}
+    for pref in user_preferences:
+        for genre in parse_multi_value(pref.get('genres', [])):
+            weights['genres'][genre] = weights['genres'].get(genre, 0) + 1
+
+        director = str(pref.get('director', '')).strip()
+        if director and director.lower() != 'nan':
+            weights['directors'][director] = weights['directors'].get(director, 0) + 1
+
+        for actor in parse_multi_value(pref.get('actors', []))[:3]:
+            weights['actors'][actor] = weights['actors'].get(actor, 0) + 1
+
+    print(f"计算的权重: {weights}")
+    return weights
+
+
+def calculate_content_similarity(row, user_data):
+    """Compute rule-based content similarity against typed user preferences."""
+    recommend_type = user_data.get('_active_type', 'movie')
+    user_preferences = get_preferences_for_type(user_data, recommend_type)
+    if not user_preferences:
+        return random.uniform(0.4, 0.6)
+
+    item_genres = set(parse_multi_value(row.get('genres', [])))
+    item_director = str(row.get('director', '')).strip()
+    item_actors = set(parse_multi_value(row.get('actors', []))[:3])
+
+    similarity_score = 0.0
+    match_count = 0
+    for pref in user_preferences:
+        pref_genres = set(parse_multi_value(pref.get('genres', [])))
+        pref_director = str(pref.get('director', '')).strip()
+        pref_actors = set(parse_multi_value(pref.get('actors', []))[:3])
+
+        genre_match = len(item_genres & pref_genres) / max(len(item_genres), len(pref_genres), 1)
+        director_match = 1.0 if item_director and item_director == pref_director else 0.0
+        actor_match = len(item_actors & pref_actors) / max(len(item_actors), len(pref_actors), 1)
+        similarity_score += (genre_match * 0.6) + (director_match * 0.2) + (actor_match * 0.2)
+        match_count += 1
+
+    return similarity_score / max(match_count, 1)
+
+
+def add_negative_feedback(item_id, item_type='movie', reason=''):
+    """Record negative feedback in user data."""
+    user_data = init_or_repair_user_data()
+    disliked_items = user_data.get('disliked_items', [])
+    item_id = str(item_id).strip()
+    if not any(str(item.get('id', '')).strip() == item_id for item in disliked_items):
+        disliked_items.append({
+            'id': item_id,
+            'item_type': item_type,
+            'reason': reason,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    user_data['disliked_items'] = disliked_items
+    safe_write_json(Config.USER_DATA_FILE, user_data)
+    return True
+
+
+def generate_personalized_recommendations(recommend_type):
+    """Generate recommendations with NCF + TextCNN + typed preference buckets."""
+    random.seed(datetime.now().timestamp())
+    print(f"\nGenerating {recommend_type} recommendations...")
+
+    items_df = load_dataset(recommend_type)
+    if items_df.empty:
+        print("Dataset is empty.")
+        return [{"id": "0", "title": f"{recommend_type} dataset is empty", "genres": "", "rating": 0, "cover_url": ""}]
+
+    items_df = preprocess_dataset(items_df)
+
+    user_data = init_or_repair_user_data()
+    active_user_data = dict(user_data)
+    active_user_data['_active_type'] = recommend_type
+    user_preferences = get_preferences_for_type(user_data, recommend_type)
+    user_behavior = get_behavior_for_type(user_data, recommend_type)
+
+    blacklist = [item['item_id'] for item in user_data.get('blacklist', []) if item.get('item_type') == recommend_type]
+    if blacklist:
+        items_df = items_df[~items_df['id'].isin(blacklist)]
+        print(f"Applied blacklist, remaining items: {len(items_df)}")
+
+    ncf_scores = None
+    if NCF_AVAILABLE:
+        try:
+            ncf_recommender = NCFRecommender()
+            if ncf_recommender.train(items_df, user_preferences, user_behavior):
+                ncf_scores = normalize_score_map(ncf_recommender.predict_scores(items_df))
+                print(f"NCF scores ready for {len(user_preferences)} preferences")
+        except Exception as exc:
+            print(f"NCF training failed: {exc}")
+
+    textcnn_scores = build_textcnn_scores(items_df, user_preferences)
+    if textcnn_scores:
+        print(f"TextCNN scores ready for {len(user_preferences)} preferences")
+    else:
+        print("TextCNN unavailable, using rule-based content fallback")
+
+    items_df['diversity_score'] = items_df.apply(lambda row: calculate_diversity_score(row, items_df), axis=1)
+    preference_weights = calculate_preference_weights(user_preferences)
+    items_df['final_score'] = items_df.apply(
+        lambda row: calculate_item_score(row, preference_weights, active_user_data, ncf_scores, textcnn_scores),
+        axis=1
+    )
+
+    items_df = items_df.sort_values('final_score', ascending=False)
+    items_df['final_score'] = items_df['final_score'] * np.random.uniform(0.98, 1.02, size=len(items_df))
+    items_df = items_df.sort_values('final_score', ascending=False)
+
+    final_result = apply_diversity_strategy(items_df)
+    if len(final_result) > 5:
+        top5 = final_result.head(5)
+        rest = final_result.iloc[5:].sample(frac=1, random_state=int(datetime.now().timestamp()))
+        final_result = pd.concat([top5, rest])
+
+    print(f"Generated {len(final_result)} recommendations.")
+    return final_result.head(Config.MAX_RECOMMENDATIONS).to_dict('records')
+
+
+def generate_and_save_recommendations(recommend_type, force_refresh=False):
+    """Generate and save typed recommendations and weight metadata."""
+    try:
+        recommendations = generate_personalized_recommendations(recommend_type)
+
+        user_data = init_or_repair_user_data()
+        user_data['last_refresh_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        user_data['count_weights'] = {
+            'movie': calculate_preference_weights(get_preferences_for_type(user_data, 'movie')),
+            'series': calculate_preference_weights(get_preferences_for_type(user_data, 'series')),
+        }
+        safe_write_json(Config.USER_DATA_FILE, user_data)
+
+        output_data = {
+            "code": 0,
+            "user_id": "user_default",
+            "data": recommendations,
+            "count_weights": get_count_weights_for_type(user_data, recommend_type).get('genres', {}),
+            "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "refreshed": True,
+            "algorithm_version": "NCF_TextCNN_v3.0",
+            "algorithm_type": "NCF + TextCNN + Rule Fusion",
+            "refresh_reason": "forced_refresh" if force_refresh else "regular_update"
+        }
+
+        output_path = Config.RECOMMEND_OUTPUT_PATH[recommend_type]
+        safe_write_json(output_path, output_data)
+        print(f"Saved {recommend_type} recommendations to {output_path}")
+        return True
+    except Exception as exc:
+        print(f"Recommendation generation failed: {exc}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def force_refresh_all_recommendations():
     """强制刷新所有类型的推荐"""
     print("\n=== 强制刷新所有推荐 ===")

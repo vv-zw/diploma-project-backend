@@ -46,15 +46,15 @@ try:
     TEXT_CNN_AVAILABLE = True
 except ImportError as e:
     TEXT_CNN_AVAILABLE = False
-    print(f"⚠️ TextCNN不可用（{e}），将使用增强版降级方案")
+    print(f"[WARN] TextCNN unavailable ({e}), using enhanced fallback")
 
 # 尝试导入配置，如果失败则创建默认配置
 try:
     from config import Config
     config_instance = Config()
-    print("✅ 成功加载配置文件")
+    print("[OK] Loaded config")
 except ImportError as e:
-    print(f"⚠️ 无法加载配置文件: {e}，使用默认配置")
+    print(f"[WARN] Failed to load config: {e}, using default config")
 
 
     # 创建默认配置类
@@ -106,10 +106,10 @@ def load_dataset(dataset_type, force_reload=False, config=None):
                 else:
                     df['id'] = range(len(df))
 
-            print(f"✅ 从CSV加载{dataset_type}数据: {len(df)}条")
+            print(f"[OK] Loaded {len(df)} {dataset_type} rows from CSV")
             return df
         except Exception as e:
-            print(f"⚠️ 读取CSV失败: {e}")
+            print(f"[WARN] Failed to read CSV: {e}")
 
     # 降级加载JSON
     if os.path.exists(json_path):
@@ -120,7 +120,7 @@ def load_dataset(dataset_type, force_reload=False, config=None):
             print(f"ℹ️ 从JSON加载{dataset_type}数据: {len(df)}条")
             return df
         except Exception as e:
-            print(f"⚠️ 读取JSON失败: {e}")
+            print(f"[WARN] Failed to read JSON: {e}")
 
     # 返回空DataFrame
     return pd.DataFrame()
@@ -168,10 +168,10 @@ def init_text_cnn(force_reset=False, dataset_type='movie', config=None):
             text_cnn.fit(all_texts)
             init_text_cnn.text_cnn = text_cnn
             init_text_cnn.last_reset = datetime.now()
-            print(f"✅ TextCNN已初始化，加载{len(all_texts)}条文本")
+            print(f"[OK] TextCNN initialized with {len(all_texts)} texts")
         else:
             init_text_cnn.text_cnn = None
-            print("⚠️ 无文本数据用于TextCNN训练")
+            print("[WARN] No text data available for TextCNN")
 
     return init_text_cnn.text_cnn
 
@@ -413,7 +413,7 @@ def generate_recommendations(user_data, dataset_type='movie', force_refresh=True
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
-    print(f"✅ 生成{dataset_type}推荐: {len(result['data'])}条")
+    print(f"[OK] Generated {len(result['data'])} {dataset_type} recommendations")
     return result
 
 
@@ -423,9 +423,9 @@ def refresh_recommendations(user_data, dataset_type='movie', config=None):
     # 使用传入的config或全局config_instance
     current_config = config or config_instance
 
-    print(f"\n🔄 刷新{dataset_type}推荐（基于{len(user_data.get('preferences', []))}个偏好）")
+    print(f"\n[REFRESH] {dataset_type} recommendations for {len(user_data.get('preferences', []))} preferences")
     result = generate_recommendations(user_data, dataset_type, force_refresh=True, config=current_config)
-    print(f"✅ {dataset_type}推荐已更新并保存到: {current_config.RECOMMEND_OUTPUT_PATH.get(dataset_type)}")
+    print(f"[OK] Saved {dataset_type} recommendations to: {current_config.RECOMMEND_OUTPUT_PATH.get(dataset_type)}")
     return result
 
 
