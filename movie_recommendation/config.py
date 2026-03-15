@@ -6,12 +6,23 @@
 import os
 from typing import Dict, List
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency fallback
+    load_dotenv = None
+
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+if load_dotenv:
+    load_dotenv(ENV_PATH)
+
 
 class Config:
     """应用配置类"""
     
     # 获取项目根目录（兼容配置文件在子目录的情况）
-    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    BASE_DIR = BASE_DIR
 
     # Flask 配置
     SECRET_KEY = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-production')
@@ -79,6 +90,26 @@ class Config:
     LOG_DIR = os.path.join(BASE_DIR, "logs")
     LOG_FILE = os.path.join(LOG_DIR, "app.log")
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+
+    # PostgreSQL 配置
+    DATABASE_URL = os.getenv('DATABASE_URL', '').strip()
+    DB_ENABLED = os.getenv('DB_ENABLED', 'true').lower() in ('1', 'true', 'yes', 'on')
+    PGHOST = os.getenv('PGHOST', '127.0.0.1').strip()
+    PGPORT = int(os.getenv('PGPORT', '5432'))
+    PGDATABASE = os.getenv('PGDATABASE', 'movie_recommendation').strip()
+    PGUSER = os.getenv('PGUSER', 'postgres').strip()
+    PGPASSWORD = os.getenv('PGPASSWORD', '')
+    PGSCHEMA = os.getenv('PGSCHEMA', 'app').strip() or 'app'
+
+    @classmethod
+    def get_database_url(cls) -> str:
+        """Return the PostgreSQL connection URL from env vars."""
+        if cls.DATABASE_URL:
+            return cls.DATABASE_URL
+        return (
+            f"postgresql://{cls.PGUSER}:{cls.PGPASSWORD}"
+            f"@{cls.PGHOST}:{cls.PGPORT}/{cls.PGDATABASE}"
+        )
 
     @classmethod
     def init_app(cls) -> None:

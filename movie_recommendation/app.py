@@ -1006,6 +1006,7 @@ try:
         sort_weight_map,
         safe_read_csv,
     )
+    from db.user_repository import replace_user_preferences
     from search.search_engine import smart_search, search_drama_by_name, batch_search_dramas
     from watchlist.manager import manage_watchlist
 
@@ -1508,7 +1509,7 @@ def negative_feedback():
         if not item_id:
             return jsonify({"code": 400, "error": "缺少项目ID"}), 400
 
-        add_negative_feedback(item_id, item_type, reason)
+        recorded = add_negative_feedback(item_id, item_type, reason)
 
         # 立即更新推荐
         generate_and_save_recommendations(item_type)
@@ -1517,7 +1518,8 @@ def negative_feedback():
             "code": 0,
             "message": "负反馈已记录",
             "item_id": item_id,
-            "updated": True
+            "updated": True,
+            "recorded": bool(recorded)
         })
 
     except Exception as e:
@@ -1663,6 +1665,7 @@ def sync_user_data_v2():
             'movie': calculate_preference_weights(normalized_preferences['movie']),
             'series': calculate_preference_weights(normalized_preferences['series']),
         }
+        replace_user_preferences('user_default', normalized_preferences)
         user_data['preferences'] = normalized_preferences
         user_data['count_weights'] = new_weights
         user_data['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -2051,11 +2054,15 @@ def system_info():
     """获取系统信息"""
     try:
         user_data = init_or_repair_user_data()
+        preferences_count = sum(
+            len(user_data.get('preferences', {}).get(content_type, []) or [])
+            for content_type in ('movie', 'series')
+        )
         return jsonify({
             "code": 0,
             "server_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "base_dir": Config.BASE_DIR,
-            "preferences_count": len(user_data.get('preferences', [])),
+            "preferences_count": preferences_count,
             "movie_dataset_exists": os.path.exists(Config.DATASET_PATHS['movie']),
             "series_dataset_exists": os.path.exists(Config.DATASET_PATHS['series']),
             "api_version": "v2.0"

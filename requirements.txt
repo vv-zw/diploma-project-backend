@@ -18,3 +18,4 @@ jieba>=0.42.1
 
 # 工具库
 python-dotenv>=1.0.0
+psycopg[binary]>=3.2.0

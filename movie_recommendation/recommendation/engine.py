@@ -231,6 +231,9 @@ import json
 import os
 import sys
 import hashlib
+from db.content_repository import load_content_items_df
+from db.feedback_repository import add_negative_feedback_record, get_negative_feedback_ids, get_negative_feedback_records
+from db.user_repository import get_user_preferences
 
 # ------------ 强制指定config路径（关键修改） ------------
 # 直接指定config所在的目录
@@ -538,8 +541,14 @@ def save_cached_ncf_scores(recommend_type, signature, scores):
 
 # 数据加载和预处理函数
 def load_dataset(recommend_type):
-    """从原始CSV加载数据集（优先），降级到推荐结果文件"""
-    # 使用项目配置的路径
+    """Load dataset from PostgreSQL first, then fall back to CSV files."""
+    db_df = load_content_items_df(recommend_type)
+    if not db_df.empty:
+        print(f"[OK] Loaded {len(db_df)} {recommend_type} rows from PostgreSQL")
+        if 'id' not in db_df.columns:
+            db_df['id'] = range(len(db_df))
+        return db_df
+
     file_path = Config.DATASET_PATHS.get(recommend_type)
     print(f"加载数据集: {file_path}")
 
@@ -1482,6 +1491,13 @@ def init_or_repair_user_data():
     normalized_behavior = normalize_behavior_payload(user_data.get('behavior', {}))
     count_weights = ensure_count_weight_buckets(user_data.get('count_weights', {}))
 
+    postgres_preferences = get_user_preferences()
+    if postgres_preferences.get('movie') or postgres_preferences.get('series'):
+        normalized_preferences = {
+            'movie': postgres_preferences.get('movie', []),
+            'series': postgres_preferences.get('series', []),
+        }
+
     count_weights['movie'] = calculate_preference_weights(normalized_preferences['movie'])
     count_weights['series'] = calculate_preference_weights(normalized_preferences['series'])
 
@@ -1497,6 +1513,17 @@ def init_or_repair_user_data():
         f"[OK] Loaded user data, movie preferences: {len(normalized_preferences['movie'])}, "
         f"series preferences: {len(normalized_preferences['series'])}"
     )
+
+    postgres_disliked_records = get_negative_feedback_records()
+    if postgres_disliked_records:
+        existing_ids = {str(item.get('id', '')).strip() for item in user_data.get('disliked_items', [])}
+        merged = list(user_data.get('disliked_items', []))
+        for item in postgres_disliked_records:
+            if item['id'] not in existing_ids:
+                merged.append(item)
+                existing_ids.add(item['id'])
+        user_data['disliked_items'] = merged
+
     return user_data
 
 
@@ -1550,6 +1577,7 @@ def add_negative_feedback(item_id, item_type='movie', reason=''):
     user_data = init_or_repair_user_data()
     disliked_items = user_data.get('disliked_items', [])
     item_id = str(item_id).strip()
+    add_negative_feedback_record('user_default', item_id, item_type, reason)
     if not any(str(item.get('id', '')).strip() == item_id for item in disliked_items):
         disliked_items.append({
             'id': item_id,
@@ -1669,7 +1697,12 @@ def calculate_item_score(row, preference_weights, user_data, ncf_scores=None, te
     active_weight += diversity_weight
 
     score = weighted_score / max(active_weight, 1e-8)
-    if item_id in [item['id'] for item in user_data.get('disliked_items', [])]:
+    disliked_ids = get_negative_feedback_ids('user_default', user_data.get('_active_type')) or {
+        str(item.get('id', '')).strip()
+        for item in user_data.get('disliked_items', [])
+        if str(item.get('id', '')).strip()
+    }
+    if item_id in disliked_ids:
         score *= Config.NEGATIVE_FEEDBACK_PENALTY
     return float(score)
 
