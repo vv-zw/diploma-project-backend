@@ -230,6 +230,7 @@ import random
 import json
 import os
 import sys
+import hashlib
 
 # ------------ 强制指定config路径（关键修改） ------------
 # 直接指定config所在的目录
@@ -478,6 +479,63 @@ class NCFRecommender:
         return scores
 
 
+def get_model_cache_dir():
+    """Return the directory used to cache recommendation model artifacts."""
+    cache_dir = os.path.join(Config.BASE_DIR, 'cache', 'models')
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+
+def build_recommendation_signature(recommend_type, items_df, user_preferences, user_behavior):
+    """Build a stable signature for one recommendation context."""
+    id_series = items_df['id'].astype(str).tolist() if 'id' in items_df.columns else []
+    payload = {
+        'recommend_type': recommend_type,
+        'dataset_ids': id_series,
+        'preferences': user_preferences,
+        'behavior': user_behavior,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+
+def get_ncf_cache_path(recommend_type, signature):
+    """Return the cache file path for one NCF score artifact."""
+    return os.path.join(get_model_cache_dir(), f'ncf_{recommend_type}_{signature}.json')
+
+
+def load_cached_ncf_scores(recommend_type, signature):
+    """Load cached NCF scores if present."""
+    cache_path = get_ncf_cache_path(recommend_type, signature)
+    if not os.path.exists(cache_path):
+        return None
+
+    try:
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        scores = data.get('scores', {})
+        if isinstance(scores, dict) and scores:
+            print(f"Loaded cached NCF scores from {cache_path}")
+            return normalize_score_map({str(key): float(value) for key, value in scores.items()})
+    except Exception as exc:
+        print(f"Failed to load cached NCF scores: {exc}")
+    return None
+
+
+def save_cached_ncf_scores(recommend_type, signature, scores):
+    """Persist NCF scores to speed up later refresh jobs."""
+    if not isinstance(scores, dict) or not scores:
+        return
+
+    payload = {
+        'recommend_type': recommend_type,
+        'signature': signature,
+        'generated_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'scores': scores,
+    }
+    safe_write_json(get_ncf_cache_path(recommend_type, signature), payload)
+
+
 # 数据加载和预处理函数
 def load_dataset(recommend_type):
     """从原始CSV加载数据集（优先），降级到推荐结果文件"""
@@ -598,6 +656,97 @@ def calculate_preference_weights(user_preferences):
 
     print(f"计算的权重: {weights}")
     return weights
+
+
+def sort_weight_map(weight_map, limit=None):
+    """Sort a weight dictionary by weight desc, then name asc."""
+    if not isinstance(weight_map, dict):
+        return {}
+
+    items = sorted(weight_map.items(), key=lambda item: (-item[1], item[0]))
+    if isinstance(limit, int) and limit > 0:
+        items = items[:limit]
+    return {key: value for key, value in items}
+
+
+def build_recommendation_reason_summary(user_preferences, count_weights, recommend_type):
+    """Build concise recommendation reasons for the page header."""
+    reasons = []
+    top_genres = list(sort_weight_map(count_weights.get('genres', {}), limit=3).keys())
+    top_directors = list(sort_weight_map(count_weights.get('directors', {}), limit=2).keys())
+    top_actors = list(sort_weight_map(count_weights.get('actors', {}), limit=2).keys())
+
+    if top_genres:
+        reasons.append(f"偏好{'、'.join(top_genres)}题材")
+
+    if top_directors:
+        reasons.append(f"更常选择{'、'.join(top_directors)}相关作品")
+
+    if top_actors:
+        reasons.append(f"关注演员{'、'.join(top_actors)}参演内容")
+
+    ratings = []
+    years = []
+    for pref in user_preferences:
+        try:
+            rating = float(pref.get('rating', 0) or 0)
+        except (TypeError, ValueError):
+            rating = 0.0
+        if rating > 0:
+            ratings.append(rating)
+
+        try:
+            year = int(float(pref.get('year', 0) or 0))
+        except (TypeError, ValueError):
+            year = 0
+        if year > 0:
+            years.append(year)
+
+    if ratings:
+        avg_rating = sum(ratings) / len(ratings)
+        if avg_rating >= 8:
+            reasons.append("更常选择高分影片")
+        elif avg_rating >= 7:
+            reasons.append("偏好口碑较好的内容")
+
+    current_year = datetime.now().year
+    recent_years = [year for year in years if year >= current_year - 5]
+    if recent_years and len(recent_years) >= max(1, len(years) // 2):
+        reasons.append("近期更关注近年的新片风格")
+
+    if not reasons:
+        default_reason = "结合你近期的观影偏好生成推荐" if recommend_type == 'movie' else "结合你近期的追剧偏好生成推荐"
+        reasons.append(default_reason)
+
+    return reasons[:5]
+
+
+def normalize_recommendation_item(item, recommend_type):
+    """Normalize recommendation fields for stable API output."""
+    normalized = dict(item)
+    normalized['genres'] = parse_multi_value(normalized.get('genres', []))
+
+    try:
+        rating = float(normalized.get('rating', 0) or 0)
+    except (TypeError, ValueError):
+        rating = 0.0
+    normalized['rating'] = round(rating, 1)
+
+    try:
+        final_score = float(normalized.get('final_score', 0) or 0)
+    except (TypeError, ValueError):
+        final_score = 0.0
+
+    final_score = max(0.0, min(final_score, 1.0))
+    normalized['final_score'] = round(final_score, 4)
+    normalized['recommend_match_score'] = int(round(final_score * 100))
+    normalized['type'] = normalized.get('type') or recommend_type
+    normalized['content_type'] = normalized.get('content_type') or recommend_type
+    normalized['cover_url'] = str(normalized.get('cover_url', '') or '')
+    normalized['director'] = str(normalized.get('director', '') or '').strip()
+    normalized['actors'] = str(normalized.get('actors', '') or '').strip()
+    normalized['title'] = str(normalized.get('title', '') or normalized.get('name', '') or '').strip()
+    return normalized
 
 
 def calculate_content_similarity(row, user_data):
@@ -802,6 +951,15 @@ def safe_write_json(file_path, data):
         return False
 
 
+def safe_read_json(file_path, default=None):
+    """Safely read a JSON file with fallback."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {} if default is None else default
+
+
 def calculate_item_score(row, preference_weights, user_data, ncf_scores=None):
     """计算项目综合得分（增强版，确保结果变化）"""
     score = 0.0
@@ -905,7 +1063,6 @@ def calculate_item_score(row, preference_weights, user_data, ncf_scores=None, te
     if item_id in [item['id'] for item in user_data.get('disliked_items', [])]:
         score *= Config.NEGATIVE_FEEDBACK_PENALTY
 
-    score *= random.uniform(0.98, 1.02)
     return float(score)
 
 
@@ -1029,7 +1186,7 @@ def generate_and_save_recommendations(recommend_type, force_refresh=False):
 
 
 # 新增：强制刷新函数
-def generate_personalized_recommendations(recommend_type):
+def generate_personalized_recommendations(recommend_type, force_refresh=False):
     """Generate recommendations with NCF + TextCNN + rule fusion."""
     random.seed(datetime.now().timestamp())
     print(f"\nGenerating {recommend_type} recommendations...")
@@ -1051,12 +1208,22 @@ def generate_personalized_recommendations(recommend_type):
         print(f"Applied blacklist, remaining items: {len(items_df)}")
 
     ncf_scores = None
+    recommendation_signature = build_recommendation_signature(
+        recommend_type,
+        items_df,
+        user_preferences,
+        user_behavior,
+    )
     if NCF_AVAILABLE:
         try:
-            ncf_recommender = NCFRecommender()
-            if ncf_recommender.train(items_df, user_preferences, user_behavior):
-                ncf_scores = normalize_score_map(ncf_recommender.predict_scores(items_df))
-                print(f"NCF scores ready for {len(user_preferences)} preferences")
+            ncf_scores = load_cached_ncf_scores(recommend_type, recommendation_signature)
+            if ncf_scores is None:
+                ncf_recommender = NCFRecommender()
+                if ncf_recommender.train(items_df, user_preferences, user_behavior):
+                    raw_ncf_scores = ncf_recommender.predict_scores(items_df)
+                    ncf_scores = normalize_score_map(raw_ncf_scores)
+                    save_cached_ncf_scores(recommend_type, recommendation_signature, raw_ncf_scores)
+                    print(f"NCF scores ready for {len(user_preferences)} preferences")
         except Exception as exc:
             print(f"NCF training failed: {exc}")
 
@@ -1094,7 +1261,7 @@ def generate_personalized_recommendations(recommend_type):
 def generate_and_save_recommendations(recommend_type, force_refresh=False):
     """Generate and persist recommendations for the API."""
     try:
-        recommendations = generate_personalized_recommendations(recommend_type)
+        recommendations = generate_personalized_recommendations(recommend_type, force_refresh=force_refresh)
 
         user_data = init_or_repair_user_data()
         user_data['last_refresh_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1395,9 +1562,327 @@ def add_negative_feedback(item_id, item_type='movie', reason=''):
     return True
 
 
-def generate_personalized_recommendations(recommend_type):
+def get_model_cache_dir():
+    """Return the directory used to cache recommendation artifacts."""
+    cache_dir = os.path.join(Config.BASE_DIR, 'cache', 'models')
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+
+def build_recommendation_signature(recommend_type, items_df, user_preferences, user_behavior):
+    """Build a stable signature for one recommendation context."""
+    id_series = items_df['id'].astype(str).tolist() if 'id' in items_df.columns else []
+    payload = {
+        'recommend_type': recommend_type,
+        'dataset_ids': id_series,
+        'preferences': user_preferences,
+        'behavior': user_behavior,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+
+def get_ncf_cache_path(recommend_type, signature):
+    """Return the local cache file path for NCF scores."""
+    return os.path.join(get_model_cache_dir(), f'ncf_{recommend_type}_{signature}.json')
+
+
+def load_cached_ncf_scores(recommend_type, signature):
+    """Load cached NCF scores if available."""
+    cache_path = get_ncf_cache_path(recommend_type, signature)
+    if not os.path.exists(cache_path):
+        return None
+
+    try:
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        scores = data.get('scores', {})
+        if isinstance(scores, dict) and scores:
+            print(f"Loaded cached NCF scores from {cache_path}")
+            return normalize_score_map({str(key): float(value) for key, value in scores.items()})
+    except Exception as exc:
+        print(f"Failed to load cached NCF scores: {exc}")
+    return None
+
+
+def save_cached_ncf_scores(recommend_type, signature, scores):
+    """Persist NCF scores to speed up later refresh jobs."""
+    if not isinstance(scores, dict) or not scores:
+        return
+
+    payload = {
+        'recommend_type': recommend_type,
+        'signature': signature,
+        'generated_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'scores': scores,
+    }
+    safe_write_json(get_ncf_cache_path(recommend_type, signature), payload)
+
+
+def calculate_item_score(row, preference_weights, user_data, ncf_scores=None, textcnn_scores=None):
+    """Blend signals while preserving relative genre preference strength."""
+    item_id = str(row.get('id', ''))
+    weighted_score = 0.0
+    active_weight = 0.0
+
+    ncf_weight = 0.30
+    text_weight = 0.22
+    genre_weight = 0.33
+    quality_weight = 0.10
+    diversity_weight = 0.05
+
+    if ncf_scores and item_id in ncf_scores:
+        weighted_score += ncf_scores[item_id] * ncf_weight
+        active_weight += ncf_weight
+
+    if textcnn_scores and item_id in textcnn_scores:
+        weighted_score += textcnn_scores[item_id] * text_weight
+        active_weight += text_weight
+    else:
+        fallback_content = calculate_content_similarity(row, user_data)
+        weighted_score += fallback_content * text_weight
+        active_weight += text_weight
+
+    genre_weights = preference_weights.get('genres', {})
+    max_genre_weight = max(genre_weights.values(), default=1.0)
+    item_genres = parse_multi_value(row.get('genres', []))
+    genre_score_raw = sum(float(genre_weights.get(genre, 0.0)) for genre in item_genres)
+    if item_genres:
+        genre_score = min(genre_score_raw / (len(item_genres) * max_genre_weight), 1.0)
+    else:
+        genre_score = 0.0
+
+    primary_genre = item_genres[0] if item_genres else ''
+    primary_genre_score = float(genre_weights.get(primary_genre, 0.0)) / max(max_genre_weight, 1.0)
+    genre_score = min(1.0, genre_score * 0.8 + primary_genre_score * 0.2)
+    weighted_score += genre_score * genre_weight
+    active_weight += genre_weight
+
+    rating_score = min(float(row.get('rating', 0) or 0) / 10, 1.0)
+    year_score = max(0, 1 - (datetime.now().year - int(row.get('year', 0) or 0)) / 20) if row.get('year') else 0.5
+    quality_score = rating_score * 0.75 + year_score * 0.25
+    weighted_score += quality_score * quality_weight
+    active_weight += quality_weight
+
+    diversity_score = row.get('diversity_score', 0.5)
+    weighted_score += diversity_score * diversity_weight
+    active_weight += diversity_weight
+
+    score = weighted_score / max(active_weight, 1e-8)
+    if item_id in [item['id'] for item in user_data.get('disliked_items', [])]:
+        score *= Config.NEGATIVE_FEEDBACK_PENALTY
+    return float(score)
+
+
+def apply_diversity_strategy(df):
+    """Apply a deterministic diversity strategy without random reordering."""
+    max_recs = Config.MAX_RECOMMENDATIONS
+    if df.empty or len(df) <= max_recs:
+        return df
+
+    sorted_df = df.sort_values(['final_score', 'rating'], ascending=[False, False]).copy()
+    genre_pick_count = {}
+    selected_rows = []
+
+    for _, row in sorted_df.iterrows():
+        primary_genres = parse_multi_value(row.get('genres', []))
+        primary_genre = primary_genres[0] if primary_genres else 'unknown'
+        picked = genre_pick_count.get(primary_genre, 0)
+
+        if picked >= 3 and len(selected_rows) < max_recs - 2:
+            continue
+
+        selected_rows.append(row.to_dict())
+        genre_pick_count[primary_genre] = picked + 1
+        if len(selected_rows) >= max_recs:
+            break
+
+    if len(selected_rows) < max_recs:
+        selected_ids = {str(row.get('id', '')) for row in selected_rows}
+        for _, row in sorted_df.iterrows():
+            item_id = str(row.get('id', ''))
+            if item_id in selected_ids:
+                continue
+            selected_rows.append(row.to_dict())
+            selected_ids.add(item_id)
+            if len(selected_rows) >= max_recs:
+                break
+
+    return pd.DataFrame(selected_rows[:max_recs])
+
+
+def get_score_cache_path(model_name, recommend_type, signature):
+    """Return a cache file path for cached score maps."""
+    return os.path.join(get_model_cache_dir(), f'{model_name}_{recommend_type}_{signature}.json')
+
+
+def load_cached_score_map(model_name, recommend_type, signature):
+    """Load a cached score map and normalize it."""
+    cache_path = get_score_cache_path(model_name, recommend_type, signature)
+    if not os.path.exists(cache_path):
+        return None
+
+    try:
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        scores = data.get('scores', {})
+        if isinstance(scores, dict) and scores:
+            print(f"Loaded cached {model_name} scores from {cache_path}")
+            return normalize_score_map({str(key): float(value) for key, value in scores.items()})
+    except Exception as exc:
+        print(f"Failed to load cached {model_name} scores: {exc}")
+    return None
+
+
+def save_cached_score_map(model_name, recommend_type, signature, scores):
+    """Persist a score map for later reuse."""
+    if not isinstance(scores, dict) or not scores:
+        return
+
+    payload = {
+        'model_name': model_name,
+        'recommend_type': recommend_type,
+        'signature': signature,
+        'generated_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'scores': scores,
+    }
+    safe_write_json(get_score_cache_path(model_name, recommend_type, signature), payload)
+
+
+def get_current_recommendation_signature(recommend_type):
+    """Compute the current signature for one recommendation type."""
+    items_df = load_dataset(recommend_type)
+    if items_df.empty:
+        return ''
+
+    items_df = preprocess_dataset(items_df)
+    user_data = init_or_repair_user_data()
+    user_preferences = get_preferences_for_type(user_data, recommend_type)
+    user_behavior = get_behavior_for_type(user_data, recommend_type)
+    return build_recommendation_signature(recommend_type, items_df, user_preferences, user_behavior)
+
+
+def build_recommendation_reason_summary(user_preferences, count_weights, recommend_type):
+    """Build richer recommendation reasons for the page header."""
+    reasons = []
+    top_genres = list(sort_weight_map(count_weights.get('genres', {}), limit=3).keys())
+    top_directors = list(sort_weight_map(count_weights.get('directors', {}), limit=2).keys())
+    top_actors = list(sort_weight_map(count_weights.get('actors', {}), limit=2).keys())
+
+    if top_genres:
+        reasons.append(f"偏好{'、'.join(top_genres)}题材")
+    if len(top_genres) >= 2:
+        reasons.append(f"近期兴趣主要集中在{'、'.join(top_genres[:2])}风格")
+    if top_directors:
+        reasons.append(f"更常选择{'、'.join(top_directors)}相关作品")
+    if top_actors:
+        reasons.append(f"关注演员{'、'.join(top_actors)}参演内容")
+
+    ratings = []
+    years = []
+    for pref in user_preferences:
+        try:
+            rating = float(pref.get('rating', 0) or 0)
+        except (TypeError, ValueError):
+            rating = 0.0
+        if rating > 0:
+            ratings.append(rating)
+
+        try:
+            year = int(float(pref.get('year', 0) or 0))
+        except (TypeError, ValueError):
+            year = 0
+        if year > 0:
+            years.append(year)
+
+    if ratings:
+        avg_rating = sum(ratings) / len(ratings)
+        if avg_rating >= 8:
+            reasons.append("更常选择高分影片")
+        elif avg_rating >= 7:
+            reasons.append("偏好口碑较好的内容")
+
+    current_year = datetime.now().year
+    recent_years = [year for year in years if year >= current_year - 5]
+    if recent_years and len(recent_years) >= max(1, len(years) // 2):
+        reasons.append("近期更关注近年的新片风格")
+
+    if user_preferences:
+        reasons.append(f"本次推荐综合参考了{len(user_preferences)}条历史偏好")
+
+    if not reasons:
+        default_reason = "结合你近期的观影偏好生成推荐" if recommend_type == 'movie' else "结合你近期的追剧偏好生成推荐"
+        reasons.append(default_reason)
+
+    deduped = []
+    for reason in reasons:
+        if reason not in deduped:
+            deduped.append(reason)
+    return deduped[:6]
+
+
+def build_textcnn_scores(items_df, user_preferences, recommend_type=None, signature=None):
+    """Encode item texts and user history, then score candidates by cosine similarity."""
+    if not TEXTCNN_AVAILABLE or items_df.empty or not user_preferences:
+        return None
+
+    if recommend_type and signature:
+        cached_scores = load_cached_score_map('textcnn', recommend_type, signature)
+        if cached_scores is not None:
+            return cached_scores
+
+    preference_texts = [build_item_text(pref) for pref in user_preferences]
+    preference_texts = [text for text in preference_texts if text]
+    item_texts = [build_item_text(row) for _, row in items_df.iterrows()]
+    item_texts = [text for text in item_texts if text]
+    training_texts = list(dict.fromkeys(preference_texts + item_texts))
+    if not training_texts:
+        return None
+
+    try:
+        encoder = TextCNN()
+        encoder.fit(training_texts)
+    except Exception as exc:
+        print(f"TextCNN initialization failed: {exc}")
+        return None
+
+    weighted_vectors = []
+    for pref in user_preferences:
+        text = build_item_text(pref)
+        if not text:
+            continue
+        try:
+            vector = encoder.extract_features(text)
+        except Exception:
+            continue
+        weight = max(1.0, float(pref.get('rating', 0) or 0) / 5.0)
+        weighted_vectors.append((np.asarray(vector, dtype=float), weight))
+
+    if not weighted_vectors:
+        return None
+
+    total_weight = sum(weight for _, weight in weighted_vectors)
+    user_vector = sum(vector * weight for vector, weight in weighted_vectors) / max(total_weight, 1e-8)
+
+    raw_scores = {}
+    for _, row in items_df.iterrows():
+        item_id = str(row.get('id', ''))
+        text = build_item_text(row)
+        if not item_id or not text:
+            continue
+        try:
+            item_vector = encoder.extract_features(text)
+        except Exception:
+            continue
+        raw_scores[item_id] = cosine_score(user_vector, item_vector)
+
+    if recommend_type and signature and raw_scores:
+        save_cached_score_map('textcnn', recommend_type, signature, raw_scores)
+    return normalize_score_map(raw_scores) if raw_scores else None
+
+
+def generate_personalized_recommendations(recommend_type, force_refresh=False):
     """Generate recommendations with NCF + TextCNN + typed preference buckets."""
-    random.seed(datetime.now().timestamp())
     print(f"\nGenerating {recommend_type} recommendations...")
 
     items_df = load_dataset(recommend_type)
@@ -1418,17 +1903,28 @@ def generate_personalized_recommendations(recommend_type):
         items_df = items_df[~items_df['id'].isin(blacklist)]
         print(f"Applied blacklist, remaining items: {len(items_df)}")
 
+    recommendation_signature = build_recommendation_signature(
+        recommend_type,
+        items_df,
+        user_preferences,
+        user_behavior,
+    )
+
     ncf_scores = None
     if NCF_AVAILABLE:
         try:
-            ncf_recommender = NCFRecommender()
-            if ncf_recommender.train(items_df, user_preferences, user_behavior):
-                ncf_scores = normalize_score_map(ncf_recommender.predict_scores(items_df))
-                print(f"NCF scores ready for {len(user_preferences)} preferences")
+            ncf_scores = load_cached_ncf_scores(recommend_type, recommendation_signature)
+            if ncf_scores is None:
+                ncf_recommender = NCFRecommender()
+                if ncf_recommender.train(items_df, user_preferences, user_behavior):
+                    raw_ncf_scores = ncf_recommender.predict_scores(items_df)
+                    ncf_scores = normalize_score_map(raw_ncf_scores)
+                    save_cached_ncf_scores(recommend_type, recommendation_signature, raw_ncf_scores)
+                    print(f"NCF scores ready for {len(user_preferences)} preferences")
         except Exception as exc:
             print(f"NCF training failed: {exc}")
 
-    textcnn_scores = build_textcnn_scores(items_df, user_preferences)
+    textcnn_scores = build_textcnn_scores(items_df, user_preferences, recommend_type, recommendation_signature)
     if textcnn_scores:
         print(f"TextCNN scores ready for {len(user_preferences)} preferences")
     else:
@@ -1441,54 +1937,246 @@ def generate_personalized_recommendations(recommend_type):
         axis=1
     )
 
-    items_df = items_df.sort_values('final_score', ascending=False)
-    items_df['final_score'] = items_df['final_score'] * np.random.uniform(0.98, 1.02, size=len(items_df))
-    items_df = items_df.sort_values('final_score', ascending=False)
-
     final_result = apply_diversity_strategy(items_df)
-    if len(final_result) > 5:
-        top5 = final_result.head(5)
-        rest = final_result.iloc[5:].sample(frac=1, random_state=int(datetime.now().timestamp()))
-        final_result = pd.concat([top5, rest])
+    final_result = final_result.sort_values(['final_score', 'rating'], ascending=[False, False])
 
     print(f"Generated {len(final_result)} recommendations.")
-    return final_result.head(Config.MAX_RECOMMENDATIONS).to_dict('records')
+    return [
+        normalize_recommendation_item(item, recommend_type)
+        for item in final_result.head(Config.MAX_RECOMMENDATIONS).to_dict('records')
+    ]
+
+
+def get_candidate_pool_size():
+    """Return how many high-score items to keep for refresh rotation."""
+    return max(int(Config.MAX_RECOMMENDATIONS) * 3, 30)
+
+
+def build_candidate_pool(items_df, recommend_type):
+    """Keep a larger high-score pool so refresh can rotate content without recomputing."""
+    if items_df is None or items_df.empty:
+        return []
+
+    sorted_df = items_df.sort_values(['final_score', 'rating'], ascending=[False, False]).copy()
+    pool_size = min(len(sorted_df), get_candidate_pool_size())
+    pool_records = sorted_df.head(pool_size).to_dict('records')
+    return [normalize_recommendation_item(item, recommend_type) for item in pool_records if isinstance(item, dict)]
+
+
+def pick_refresh_variant(candidate_pool, recommend_type, recent_ids=None):
+    """Pick one display batch from the candidate pool while avoiding immediate repeats."""
+    if not isinstance(candidate_pool, list) or not candidate_pool:
+        return []
+
+    max_recs = int(Config.MAX_RECOMMENDATIONS)
+    recent_ids = {str(item_id) for item_id in (recent_ids or []) if str(item_id).strip()}
+    available_pool = [item for item in candidate_pool if str(item.get('id', '')) not in recent_ids]
+    if len(available_pool) < max_recs:
+        available_pool = list(candidate_pool)
+
+    weighted_candidates = []
+    for index, item in enumerate(available_pool):
+        score = item.get('recommend_match_score', item.get('final_score', 0))
+        try:
+            numeric_score = float(score)
+            if numeric_score > 1:
+                numeric_score = numeric_score / 100.0
+        except (TypeError, ValueError):
+            numeric_score = 0.0
+
+        rank_bonus = max(0.05, 1.0 - (index / max(len(available_pool), 1)) * 0.45)
+        weight = max(0.05, numeric_score) * rank_bonus
+        weighted_candidates.append((dict(item), weight))
+
+    selected = []
+    while weighted_candidates and len(selected) < min(max_recs, len(candidate_pool)):
+        total_weight = sum(weight for _, weight in weighted_candidates)
+        pick = random.random() * total_weight if total_weight > 0 else 0
+        cumulative = 0.0
+        chosen_index = 0
+
+        for idx, (_, weight) in enumerate(weighted_candidates):
+            cumulative += weight
+            if cumulative >= pick:
+                chosen_index = idx
+                break
+
+        chosen_item, _ = weighted_candidates.pop(chosen_index)
+        selected.append(chosen_item)
+
+    selected.sort(
+        key=lambda item: (
+            float(item.get('recommend_match_score', 0) or 0),
+            float(item.get('final_score', 0) or 0),
+            float(item.get('rating', 0) or 0),
+        ),
+        reverse=True,
+    )
+    return selected[:max_recs]
+
+
+def rotate_cached_recommendations(recommend_type):
+    """Refresh the displayed recommendation batch from the cached candidate pool."""
+    output_path = Config.RECOMMEND_OUTPUT_PATH[recommend_type]
+    recommend_data = safe_read_json(output_path, {}) if os.path.exists(output_path) else {}
+    candidate_pool = recommend_data.get('candidate_pool', [])
+    if not isinstance(candidate_pool, list) or not candidate_pool:
+        return {'ok': False, 'error': 'missing_candidate_pool'}
+
+    recent_display_ids = recommend_data.get('recent_display_ids', [])
+    if not isinstance(recent_display_ids, list):
+        recent_display_ids = []
+
+    rotated_data = pick_refresh_variant(candidate_pool, recommend_type, recent_ids=recent_display_ids)
+    if not rotated_data:
+        return {'ok': False, 'error': 'failed_to_rotate_recommendations'}
+
+    recommend_data['data'] = rotated_data
+    recommend_data['generated_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    recommend_data['refresh_reason'] = 'candidate_pool_rotation'
+    recommend_data['refreshed'] = True
+    recommend_data['rotation_count'] = int(recommend_data.get('rotation_count', 0) or 0) + 1
+    recommend_data['recent_display_ids'] = [
+        str(item.get('id', ''))
+        for item in rotated_data
+        if str(item.get('id', '')).strip()
+    ]
+    safe_write_json(output_path, recommend_data)
+    return {
+        'ok': True,
+        'reused': True,
+        'rotated': True,
+        'signature': str(recommend_data.get('signature', '') or ''),
+    }
 
 
 def generate_and_save_recommendations(recommend_type, force_refresh=False):
     """Generate and save typed recommendations and weight metadata."""
     try:
-        recommendations = generate_personalized_recommendations(recommend_type)
+        current_signature = get_current_recommendation_signature(recommend_type)
+        output_path = Config.RECOMMEND_OUTPUT_PATH[recommend_type]
+        existing_data = safe_read_json(output_path, {}) if os.path.exists(output_path) else {}
+        cached_signature = str(existing_data.get('signature', '') or '')
+
+        if current_signature and cached_signature == current_signature and not force_refresh:
+            existing_data['generated_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            existing_data['refresh_reason'] = 'cache_reused'
+            existing_data['refreshed'] = False
+            safe_write_json(output_path, existing_data)
+            print(f"Reused cached recommendations for {recommend_type}")
+            return {
+                'ok': True,
+                'reused': True,
+                'signature': current_signature,
+            }
+
+        items_df = load_dataset(recommend_type)
+        if items_df.empty:
+            return {
+                'ok': False,
+                'reused': False,
+                'error': 'dataset_empty',
+            }
+
+        items_df = preprocess_dataset(items_df)
 
         user_data = init_or_repair_user_data()
+        active_user_data = dict(user_data)
+        active_user_data['_active_type'] = recommend_type
+        user_preferences = get_preferences_for_type(user_data, recommend_type)
+        user_behavior = get_behavior_for_type(user_data, recommend_type)
+
+        blacklist = [item['item_id'] for item in user_data.get('blacklist', []) if item.get('item_type') == recommend_type]
+        if blacklist:
+            items_df = items_df[~items_df['id'].isin(blacklist)]
+
+        recommendation_signature = build_recommendation_signature(
+            recommend_type,
+            items_df,
+            user_preferences,
+            user_behavior,
+        )
+
+        ncf_scores = None
+        if NCF_AVAILABLE:
+            try:
+                ncf_scores = load_cached_ncf_scores(recommend_type, recommendation_signature)
+                if ncf_scores is None:
+                    ncf_recommender = NCFRecommender()
+                    if ncf_recommender.train(items_df, user_preferences, user_behavior):
+                        raw_ncf_scores = ncf_recommender.predict_scores(items_df)
+                        ncf_scores = normalize_score_map(raw_ncf_scores)
+                        save_cached_ncf_scores(recommend_type, recommendation_signature, raw_ncf_scores)
+            except Exception as exc:
+                print(f"NCF training failed: {exc}")
+
+        textcnn_scores = build_textcnn_scores(items_df, user_preferences, recommend_type, recommendation_signature)
+        items_df['diversity_score'] = items_df.apply(lambda row: calculate_diversity_score(row, items_df), axis=1)
+        preference_weights = calculate_preference_weights(user_preferences)
+        items_df['final_score'] = items_df.apply(
+            lambda row: calculate_item_score(row, preference_weights, active_user_data, ncf_scores, textcnn_scores),
+            axis=1
+        )
+
+        candidate_pool = build_candidate_pool(items_df, recommend_type)
+        recommendations = pick_refresh_variant(candidate_pool, recommend_type)
+
         user_data['last_refresh_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         user_data['count_weights'] = {
             'movie': calculate_preference_weights(get_preferences_for_type(user_data, 'movie')),
             'series': calculate_preference_weights(get_preferences_for_type(user_data, 'series')),
         }
         safe_write_json(Config.USER_DATA_FILE, user_data)
+        current_weights = get_count_weights_for_type(user_data, recommend_type)
+        current_weights = {
+            'genres': sort_weight_map(current_weights.get('genres', {})),
+            'directors': sort_weight_map(current_weights.get('directors', {})),
+            'actors': sort_weight_map(current_weights.get('actors', {})),
+        }
+        recommend_reasons_summary = build_recommendation_reason_summary(
+            get_preferences_for_type(user_data, recommend_type),
+            current_weights,
+            recommend_type,
+        )
 
         output_data = {
             "code": 0,
             "user_id": "user_default",
             "data": recommendations,
-            "count_weights": get_count_weights_for_type(user_data, recommend_type).get('genres', {}),
+            "count_weights": current_weights,
+            "recommend_reasons_summary": recommend_reasons_summary,
+            "candidate_pool": candidate_pool,
+            "candidate_pool_size": len(candidate_pool),
+            "recent_display_ids": [
+                str(item.get('id', ''))
+                for item in recommendations
+                if str(item.get('id', '')).strip()
+            ],
+            "rotation_count": 0,
             "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "refreshed": True,
-            "algorithm_version": "NCF_TextCNN_v3.0",
+            "algorithm_version": "NCF_TextCNN_v3.1",
             "algorithm_type": "NCF + TextCNN + Rule Fusion",
-            "refresh_reason": "forced_refresh" if force_refresh else "regular_update"
+            "refresh_reason": "forced_refresh" if force_refresh else "regular_update",
+            "signature": current_signature,
         }
 
-        output_path = Config.RECOMMEND_OUTPUT_PATH[recommend_type]
         safe_write_json(output_path, output_data)
         print(f"Saved {recommend_type} recommendations to {output_path}")
-        return True
+        return {
+            'ok': True,
+            'reused': False,
+            'signature': current_signature,
+        }
     except Exception as exc:
         print(f"Recommendation generation failed: {exc}")
         import traceback
         traceback.print_exc()
-        return False
+        return {
+            'ok': False,
+            'reused': False,
+            'error': str(exc),
+        }
 
 
 def force_refresh_all_recommendations():

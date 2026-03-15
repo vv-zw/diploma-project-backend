@@ -991,14 +991,19 @@ try:
     from utils.text_utils import calculate_similarity
     from recommendation.engine import (
         add_negative_feedback,
+        build_recommendation_reason_summary,
         calculate_preference_weights,
         generate_and_save_recommendations,
         generate_personalized_recommendations,
+        get_current_recommendation_signature,
         get_behavior_for_type,
         get_count_weights_for_type,
         get_preferences_for_type,
         init_or_repair_user_data,
+        normalize_recommendation_item,
         normalize_preferences_payload,
+        rotate_cached_recommendations,
+        sort_weight_map,
         safe_read_csv,
     )
     from search.search_engine import smart_search, search_drama_by_name, batch_search_dramas
@@ -1052,6 +1057,24 @@ def build_refresh_job(recommend_type):
     return job_id
 
 
+def build_completed_refresh_job(recommend_type, reused=False):
+    """Create an already-finished refresh job for cache hits."""
+    job_id = f"{recommend_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with refresh_jobs_lock:
+        refresh_jobs[job_id] = {
+            "job_id": job_id,
+            "type": recommend_type,
+            "status": "done",
+            "error": "",
+            "created_at": now,
+            "started_at": now,
+            "finished_at": now,
+            "reused": reused,
+        }
+    return job_id
+
+
 def run_refresh_job(job_id, recommend_type):
     """Execute recommendation refresh in a background thread."""
     with refresh_jobs_lock:
@@ -1062,14 +1085,17 @@ def run_refresh_job(job_id, recommend_type):
         job["started_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     try:
-        ok = generate_and_save_recommendations(recommend_type, force_refresh=True)
+        refresh_result = generate_and_save_recommendations(recommend_type, force_refresh=True)
+        ok = bool(refresh_result.get('ok')) if isinstance(refresh_result, dict) else bool(refresh_result)
         with refresh_jobs_lock:
             job = refresh_jobs.get(job_id)
             if not job:
                 return
             job["status"] = "done" if ok else "failed"
             if not ok:
-                job["error"] = "refresh_failed"
+                job["error"] = refresh_result.get('error', 'refresh_failed') if isinstance(refresh_result, dict) else "refresh_failed"
+            else:
+                job["reused"] = bool(refresh_result.get('reused')) if isinstance(refresh_result, dict) else False
             job["finished_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     except Exception as exc:
         with refresh_jobs_lock:
@@ -1407,12 +1433,35 @@ def get_recommend():
                 df = df.sample(frac=1).reset_index(drop=True)
                 recommendations = df.head(10).to_dict('records')
 
+        recommendations = [
+            normalize_recommendation_item(item, recommend_type)
+            for item in recommendations
+            if isinstance(item, dict)
+        ]
+
         user_data = init_or_repair_user_data()
+        current_weights = recommend_data.get("count_weights")
+        if not isinstance(current_weights, dict) or not {'genres', 'directors', 'actors'}.issubset(current_weights.keys()):
+            current_weights = get_count_weights_for_type(user_data, recommend_type)
+
+        current_weights = {
+            "genres": sort_weight_map(current_weights.get("genres", {})),
+            "directors": sort_weight_map(current_weights.get("directors", {})),
+            "actors": sort_weight_map(current_weights.get("actors", {})),
+        }
+        recommend_reasons_summary = recommend_data.get("recommend_reasons_summary")
+        if not isinstance(recommend_reasons_summary, list):
+            recommend_reasons_summary = build_recommendation_reason_summary(
+                get_preferences_for_type(user_data, recommend_type),
+                current_weights,
+                recommend_type,
+            )
 
         return jsonify({
             "code": 0,
             "data": recommendations,
-            "count_weights": user_data.get('count_weights', {}),
+            "count_weights": current_weights,
+            "recommend_reasons_summary": recommend_reasons_summary,
             "generated_time": recommend_data.get('generated_time', datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
             "refreshed": need_refresh,
             "algorithm_version": recommend_data.get('algorithm_version', "NCF+TextCNN_v1.0")
@@ -1655,11 +1704,35 @@ def get_recommend_v2():
                 if not df.empty:
                     recommendations = df.sample(frac=1).reset_index(drop=True).head(10).to_dict('records')
 
+        recommendations = [
+            normalize_recommendation_item(item, recommend_type)
+            for item in recommendations
+            if isinstance(item, dict)
+        ]
+
         user_data = init_or_repair_user_data()
+        current_weights = recommend_data.get("count_weights")
+        if not isinstance(current_weights, dict) or not {'genres', 'directors', 'actors'}.issubset(current_weights.keys()):
+            current_weights = get_count_weights_for_type(user_data, recommend_type)
+
+        current_weights = {
+            "genres": sort_weight_map(current_weights.get("genres", {})),
+            "directors": sort_weight_map(current_weights.get("directors", {})),
+            "actors": sort_weight_map(current_weights.get("actors", {})),
+        }
+        recommend_reasons_summary = recommend_data.get("recommend_reasons_summary")
+        if not isinstance(recommend_reasons_summary, list):
+            recommend_reasons_summary = build_recommendation_reason_summary(
+                get_preferences_for_type(user_data, recommend_type),
+                current_weights,
+                recommend_type,
+            )
+
         return jsonify({
             "code": 0,
             "data": recommendations,
-            "count_weights": get_count_weights_for_type(user_data, recommend_type),
+            "count_weights": current_weights,
+            "recommend_reasons_summary": recommend_reasons_summary,
             "generated_time": recommend_data.get('generated_time', ''),
             "refreshed": False,
             "algorithm_version": recommend_data.get('algorithm_version', "NCF_TextCNN_v3.0")
@@ -1682,6 +1755,33 @@ def refresh_recommendations_v2():
             return jsonify({"code": 400, "error": "invalid_type"}), 400
 
         if content_type:
+            recommend_data = safe_read_json(Config.RECOMMEND_OUTPUT_PATH[content_type], {})
+            cached_signature = str(recommend_data.get('signature', '') or '')
+            current_signature = get_current_recommendation_signature(content_type)
+            if current_signature and cached_signature == current_signature:
+                rotation_result = rotate_cached_recommendations(content_type)
+                if not rotation_result.get('ok'):
+                    job_id = start_refresh_job(content_type)
+                    return jsonify({
+                        "code": 0,
+                        "message": "refresh_queued",
+                        "type": content_type,
+                        "job_id": job_id,
+                        "status": "queued",
+                        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    })
+                job_id = build_completed_refresh_job(content_type, reused=True)
+                return jsonify({
+                    "code": 0,
+                    "message": "refresh_rotated" if rotation_result.get('ok') else "refresh_reused",
+                    "type": content_type,
+                    "job_id": job_id,
+                    "status": "done",
+                    "reused": True,
+                    "rotated": bool(rotation_result.get('rotated')),
+                    "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                })
+
             job_id = start_refresh_job(content_type)
             return jsonify({
                 "code": 0,
@@ -1692,12 +1792,29 @@ def refresh_recommendations_v2():
                 "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             })
 
-        jobs = {'movie': start_refresh_job('movie'), 'series': start_refresh_job('series')}
+        jobs = {}
+        reused = {}
+        for recommend_type in ('movie', 'series'):
+            recommend_data = safe_read_json(Config.RECOMMEND_OUTPUT_PATH[recommend_type], {})
+            cached_signature = str(recommend_data.get('signature', '') or '')
+            current_signature = get_current_recommendation_signature(recommend_type)
+            if current_signature and cached_signature == current_signature:
+                rotation_result = rotate_cached_recommendations(recommend_type)
+                if rotation_result.get('ok'):
+                    jobs[recommend_type] = build_completed_refresh_job(recommend_type, reused=True)
+                    reused[recommend_type] = True
+                else:
+                    jobs[recommend_type] = start_refresh_job(recommend_type)
+                    reused[recommend_type] = False
+            else:
+                jobs[recommend_type] = start_refresh_job(recommend_type)
+                reused[recommend_type] = False
         return jsonify({
             "code": 0,
             "message": "refresh_queued",
             "type": "all",
             "jobs": jobs,
+            "reused": reused,
             "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         })
     except Exception as e:
