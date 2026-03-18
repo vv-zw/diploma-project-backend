@@ -27,6 +27,8 @@ class Config:
     # Flask 配置
     SECRET_KEY = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-production')
     DEBUG = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin').strip()
+    ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin123').strip()
     
     # 服务器配置
     HOST = os.getenv('HOST', '0.0.0.0')

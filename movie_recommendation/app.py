@@ -1038,12 +1038,21 @@ except ImportError as e:
             return False
 
 app = Flask(__name__)
+app.secret_key = getattr(config_instance, "SECRET_KEY", "dev-secret-key-change-in-production")
 CORS(app, resources={r"/*": {"origins": "*"}})  # 更宽松的CORS配置
 
 # 全局配置引用
 Config = config_instance
 refresh_jobs = {}
 refresh_jobs_lock = threading.Lock()
+
+try:
+    from admin import admin_api_bp, admin_bp
+
+    app.register_blueprint(admin_bp)
+    app.register_blueprint(admin_api_bp)
+except ImportError as e:
+    print(f"[WARN] 管理后台模块导入失败: {e}")
 
 
 def build_refresh_job(recommend_type):

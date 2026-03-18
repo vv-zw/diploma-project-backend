@@ -36,6 +36,28 @@ class TestSystemAPI:
         assert 'api_version' in data
 
 
+class TestAdminAPI:
+    """管理员后台骨架测试"""
+
+    def test_admin_login_page(self, client):
+        response = client.get('/admin/login')
+        assert response.status_code == 200
+
+    def test_admin_dashboard_requires_login(self, client):
+        response = client.get('/admin/')
+        assert response.status_code == 302
+        assert '/admin/login' in response.headers['Location']
+
+    def test_admin_login_success(self, client):
+        response = client.post(
+            '/admin/login',
+            data={'username': 'admin', 'password': 'admin123'},
+            follow_redirects=False
+        )
+        assert response.status_code == 302
+        assert '/admin/' in response.headers['Location']
+
+
 class TestMovieAPI:
     """电影 API 测试"""
     
@@ -106,6 +128,27 @@ class TestRecommendationAPI:
         assert data['code'] == 0
         assert 'count_weights' in data
 
+    def test_sync_user_data_allows_empty_payload(self, client):
+        response = client.post(
+            '/sync-user-data',
+            data=json.dumps({'preferences': []}),
+            content_type='application/json'
+        )
+        assert response.status_code == 200
+
+        data = json.loads(response.data)
+        assert data['code'] == 0
+        assert data['saved_preferences_count'] == 0
+
+    def test_get_user_preferences(self, client):
+        response = client.get('/user-preferences')
+        assert response.status_code == 200
+
+        data = json.loads(response.data)
+        assert data['code'] == 0
+        assert 'preferences' in data
+        assert 'count_weights' in data
+
 
 class TestSearchAPI:
     """搜索 API 测试"""
@@ -157,6 +200,18 @@ class TestWatchlistAPI:
         
         data = json.loads(response.data)
         assert data['code'] == 0
+
+    def test_clear_watchlist(self, client):
+        response = client.post(
+            '/watchlist/clear',
+            data=json.dumps({}),
+            content_type='application/json'
+        )
+        assert response.status_code == 200
+
+        data = json.loads(response.data)
+        assert data['code'] == 0
+        assert 'deleted_count' in data
 
 
 if __name__ == '__main__':
