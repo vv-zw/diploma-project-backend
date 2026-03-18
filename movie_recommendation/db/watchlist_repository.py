@@ -139,3 +139,28 @@ def remove_watchlist_item(item_id: str, item_type: str, user_id: str = "user_def
     except Exception as exc:
         print(f"[WARN] Failed to remove watchlist item from PostgreSQL: {exc}")
         return {"status": "db_error", "message": "database_error"}
+
+
+def clear_watchlist_items(user_id: str = "user_default", content_type: Optional[str] = None) -> Dict:
+    """Remove watchlist rows for one user, optionally narrowed by content type."""
+    if not is_database_enabled():
+        return {"status": "db_unavailable", "message": "database_unavailable"}
+
+    where_sql = "WHERE user_id = %(user_id)s"
+    params = {"user_id": user_id}
+    if content_type:
+        where_sql += " AND content_type = %(content_type)s"
+        params["content_type"] = str(content_type).strip().lower()
+
+    sql = f"DELETE FROM {Config.PGSCHEMA}.watchlist_items {where_sql}"
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                deleted_count = cur.rowcount
+            conn.commit()
+        return {"status": "success", "message": "watchlist_cleared", "deleted_count": deleted_count}
+    except Exception as exc:
+        print(f"[WARN] Failed to clear watchlist items from PostgreSQL: {exc}")
+        return {"status": "db_error", "message": "database_error"}

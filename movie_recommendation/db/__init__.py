@@ -7,10 +7,11 @@ from .feedback_repository import (
 )
 from .watchlist_repository import (
     add_watchlist_item,
+    clear_watchlist_items,
     get_watchlist_items,
     remove_watchlist_item,
 )
-from .user_repository import get_user_preferences, replace_user_preferences
+from .user_repository import clear_user_preferences, get_user_preferences, replace_user_preferences
 
 __all__ = [
     "get_db_connection",
@@ -20,8 +21,10 @@ __all__ = [
     "get_negative_feedback_ids",
     "get_negative_feedback_records",
     "add_watchlist_item",
+    "clear_watchlist_items",
     "get_watchlist_items",
     "remove_watchlist_item",
+    "clear_user_preferences",
     "get_user_preferences",
     "replace_user_preferences",
 ]

@@ -107,3 +107,27 @@ def replace_user_preferences(user_id: str, preferences_by_type: Dict[str, List[d
     except Exception as exc:
         print(f"[WARN] Failed to replace user preferences in PostgreSQL: {exc}")
         return False
+
+
+def clear_user_preferences(user_id: str = "user_default", content_type: Optional[str] = None) -> bool:
+    """Remove stored preferences for one user, optionally narrowed by content type."""
+    if not is_database_enabled():
+        return False
+
+    where_sql = "WHERE user_id = %(user_id)s"
+    params = {"user_id": user_id}
+    if content_type:
+        where_sql += " AND content_type = %(content_type)s"
+        params["content_type"] = str(content_type).strip().lower()
+
+    sql = f"DELETE FROM {Config.PGSCHEMA}.user_preferences {where_sql}"
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+            conn.commit()
+        return True
+    except Exception as exc:
+        print(f"[WARN] Failed to clear user preferences in PostgreSQL: {exc}")
+        return False

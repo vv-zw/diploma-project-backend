@@ -929,6 +929,10 @@ from datetime import datetime
 from flask import Flask, jsonify, request, make_response, send_file
 import pandas as pd
 
+PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PACKAGE_ROOT not in sys.path:
+    sys.path.insert(0, PACKAGE_ROOT)
+
 # Force UTF-8 console output on Windows to avoid emoji log crashes under GBK code page.
 try:
     if hasattr(sys.stdout, "reconfigure"):
@@ -1006,7 +1010,7 @@ try:
         sort_weight_map,
         safe_read_csv,
     )
-    from db.user_repository import replace_user_preferences
+    from db.user_repository import clear_user_preferences, get_user_preferences, replace_user_preferences
     from search.search_engine import smart_search, search_drama_by_name, batch_search_dramas
     from watchlist.manager import manage_watchlist
 
@@ -1599,6 +1603,26 @@ def remove_from_watchlist():
         return jsonify({"code": 500, "error": f"服务器错误: {str(e)}"}), 500
 
 
+@app.route("/watchlist/clear", methods=["POST"])
+def clear_watchlist():
+    try:
+        data = request.get_json() or {}
+        content_type = str(data.get('type', '')).strip().lower() or None
+        result = manage_watchlist('clear', item_type=content_type)
+
+        return jsonify({
+            "code": 0,
+            "message": result.get('message', 'watchlist_cleared'),
+            "deleted_count": result.get('deleted_count', 0),
+            "type": content_type or 'all'
+        })
+
+    except Exception as e:
+        print(f"娓呯┖鎯崇湅娓呭崟澶辫触: {str(e)}")
+        traceback.print_exc()
+        return jsonify({"code": 500, "error": f"鏈嶅姟鍣ㄩ敊璇? {str(e)}"}), 500
+
+
 @app.route("/refresh-recommendations", methods=["POST", "GET"])
 def refresh_recommendations():
     try:
@@ -1656,8 +1680,6 @@ def sync_user_data_v2():
 
         normalized_preferences = normalize_preferences_payload(data.get('preferences', []))
         total_preferences = len(normalized_preferences['movie']) + len(normalized_preferences['series'])
-        if total_preferences == 0:
-            return jsonify({"code": 400, "error": "no_valid_preferences"}), 400
 
         user_data = init_or_repair_user_data()
         old_weights = user_data.get('count_weights', {})
@@ -1665,7 +1687,10 @@ def sync_user_data_v2():
             'movie': calculate_preference_weights(normalized_preferences['movie']),
             'series': calculate_preference_weights(normalized_preferences['series']),
         }
-        replace_user_preferences('user_default', normalized_preferences)
+        if total_preferences == 0:
+            clear_user_preferences('user_default')
+        else:
+            replace_user_preferences('user_default', normalized_preferences)
         user_data['preferences'] = normalized_preferences
         user_data['count_weights'] = new_weights
         user_data['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -1685,6 +1710,42 @@ def sync_user_data_v2():
             "saved_preferences_count": total_preferences,
             "updated_recommendations": bool(jobs),
             "jobs": jobs,
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"code": 500, "error": str(e)}), 500
+
+
+@app.route("/user-preferences", methods=["GET"])
+def get_user_preferences_route():
+    """Return current typed user preferences from the database-backed source."""
+    try:
+        content_type = str(request.args.get('type', '')).strip().lower()
+        if content_type and content_type not in ('movie', 'series'):
+            return jsonify({"code": 400, "error": "invalid_type"}), 400
+
+        user_data = init_or_repair_user_data()
+        preferences = {
+            "movie": get_preferences_for_type(user_data, 'movie'),
+            "series": get_preferences_for_type(user_data, 'series'),
+        }
+        count_weights = {
+            "movie": get_count_weights_for_type(user_data, 'movie'),
+            "series": get_count_weights_for_type(user_data, 'series'),
+        }
+
+        if content_type:
+            return jsonify({
+                "code": 0,
+                "type": content_type,
+                "preferences": preferences.get(content_type, []),
+                "count_weights": count_weights.get(content_type, {}),
+            })
+
+        return jsonify({
+            "code": 0,
+            "preferences": preferences,
+            "count_weights": count_weights,
         })
     except Exception as e:
         traceback.print_exc()
