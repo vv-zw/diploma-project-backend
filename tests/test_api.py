@@ -6,6 +6,7 @@ API 接口测试
 import pytest
 import json
 from movie_recommendation.app import app
+import admin as admin_module
 
 
 @pytest.fixture
@@ -56,6 +57,91 @@ class TestAdminAPI:
         )
         assert response.status_code == 302
         assert '/admin/' in response.headers['Location']
+
+    def test_admin_bootstrap_status(self, client):
+        response = client.get('/api/admin/bootstrap-status')
+        assert response.status_code == 200
+
+        data = json.loads(response.data)
+        assert data['code'] == 0
+        assert 'has_admin' in data
+        assert 'database_enabled' in data
+
+    def test_admin_behavior_summary(self, client):
+        login_response = client.post(
+            '/api/admin/login',
+            data=json.dumps({'username': 'admin', 'password': 'admin123'}),
+            content_type='application/json'
+        )
+        login_data = json.loads(login_response.data)
+
+        response = client.get(
+            '/api/admin/behavior-summary?tab=overview',
+            headers={'X-Admin-Token': login_data['token']}
+        )
+        assert response.status_code == 200
+
+        data = json.loads(response.data)
+        assert data['code'] == 0
+        assert 'cards' in data['data']
+        assert 'trend' in data['data']
+        assert 'top_lists' in data['data']
+
+    def test_admin_register_success(self, client, monkeypatch):
+        created = {}
+
+        monkeypatch.setattr(admin_module, 'admin_exists', lambda: False)
+        monkeypatch.setattr(admin_module, 'get_admin_by_username', lambda username: None)
+
+        def fake_create_admin_user(username, password_hash, display_name=''):
+            created['username'] = username
+            created['password_hash'] = password_hash
+            created['display_name'] = display_name
+            return True
+
+        monkeypatch.setattr(admin_module, 'create_admin_user', fake_create_admin_user)
+
+        response = client.post(
+            '/api/admin/register',
+            data=json.dumps({
+                'username': 'rootadmin',
+                'password': 'secret123',
+                'display_name': 'Root Admin'
+            }),
+            content_type='application/json'
+        )
+        assert response.status_code == 200
+
+        data = json.loads(response.data)
+        assert data['code'] == 0
+        assert data['username'] == 'rootadmin'
+        assert created['username'] == 'rootadmin'
+        assert created['display_name'] == 'Root Admin'
+        assert created['password_hash'] != 'secret123'
+
+    def test_admin_api_login_with_database_account(self, client, monkeypatch):
+        monkeypatch.setattr(
+            admin_module,
+            'get_admin_by_username',
+            lambda username: {
+                'username': username,
+                'password_hash': admin_module.generate_password_hash('secret123'),
+                'status': 'active',
+            }
+        )
+        monkeypatch.setattr(admin_module, 'update_admin_last_login', lambda username: True)
+
+        response = client.post(
+            '/api/admin/login',
+            data=json.dumps({'username': 'rootadmin', 'password': 'secret123'}),
+            content_type='application/json'
+        )
+        assert response.status_code == 200
+
+        data = json.loads(response.data)
+        assert data['code'] == 0
+        assert data['username'] == 'rootadmin'
+        assert data['token']
 
 
 class TestMovieAPI:
