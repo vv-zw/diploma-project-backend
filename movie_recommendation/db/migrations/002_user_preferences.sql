@@ -10,11 +10,15 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.user_preferences (
     director VARCHAR(255),
     actors TEXT,
     cover_url TEXT,
+    comment TEXT,
     source VARCHAR(64),
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_user_preferences UNIQUE (user_id, content_id, content_type)
 );
+
+ALTER TABLE {{SCHEMA}}.user_preferences
+    ADD COLUMN IF NOT EXISTS comment TEXT;
 
 ALTER TABLE {{SCHEMA}}.user_preferences
     ADD COLUMN IF NOT EXISTS source VARCHAR(64);

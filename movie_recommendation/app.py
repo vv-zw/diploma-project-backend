@@ -1011,7 +1011,13 @@ try:
         safe_read_csv,
     )
     from db.user_repository import clear_user_preferences, get_user_preferences, replace_user_preferences
-    from search.search_engine import smart_search, search_drama_by_name, batch_search_dramas
+    from search.search_engine import (
+        batch_search_dramas,
+        batch_search_items_by_names,
+        search_drama_by_name,
+        search_item_by_name as search_item_by_name_service,
+        smart_search,
+    )
     from watchlist.manager import manage_watchlist
 
     print("[OK] 成功加载所有模块")
@@ -1135,6 +1141,10 @@ def start_refresh_job(recommend_type):
 def search_item_by_name(item_name, item_type='movie'):
     """通用的项目搜索函数"""
     try:
+        db_result = search_item_by_name_service(item_name, item_type)
+        if db_result:
+            return db_result, None
+
         # 获取数据集路径
         csv_path = Config.DATASET_PATHS.get(item_type)
         if not os.path.exists(csv_path):
@@ -1734,9 +1744,14 @@ def get_user_preferences_route():
             return jsonify({"code": 400, "error": "invalid_type"}), 400
 
         user_data = init_or_repair_user_data()
-        preferences = {
+        db_preferences = get_user_preferences('user_default', content_type or None)
+        fallback_preferences = {
             "movie": get_preferences_for_type(user_data, 'movie'),
             "series": get_preferences_for_type(user_data, 'series'),
+        }
+        preferences = {
+            "movie": db_preferences.get('movie') or fallback_preferences['movie'],
+            "series": db_preferences.get('series') or fallback_preferences['series'],
         }
         count_weights = {
             "movie": get_count_weights_for_type(user_data, 'movie'),
@@ -1980,29 +1995,8 @@ def get_movies_by_names():
                 "error": "电影名称列表不能为空"
             }), 400
 
-        results = []
-        for name in movie_names:
-            movie_name = str(name).strip()
-            if not movie_name:
-                continue
-
-            result, error = search_item_by_name(movie_name, 'movie')
-
-            if result:
-                results.append({
-                    'name_requested': movie_name,
-                    'matched_title': result['title'],
-                    'data': result,
-                    'similarity_score': result['similarity_score']
-                })
-            elif only_return_requested:
-                results.append({
-                    'name_requested': movie_name,
-                    'matched_title': movie_name,
-                    'data': None,
-                    'error': f'未找到该电影: {movie_name}',
-                    'similarity_score': 0
-                })
+        search_results = batch_search_items_by_names(movie_names, 'movie')
+        results = search_results if only_return_requested else [item for item in search_results if item.get('data')]
 
         return jsonify({
             'code': 0,
@@ -2075,29 +2069,8 @@ def get_dramas_by_names():
                 "error": "剧集名称列表不能为空"
             }), 400
 
-        results = []
-        for name in drama_names:
-            drama_name = str(name).strip()
-            if not drama_name:
-                continue
-
-            result, error = search_item_by_name(drama_name, 'series')
-
-            if result:
-                results.append({
-                    'name_requested': drama_name,
-                    'matched_title': result['title'],
-                    'data': result,
-                    'similarity_score': result['similarity_score']
-                })
-            elif only_return_requested:
-                results.append({
-                    'name_requested': drama_name,
-                    'matched_title': drama_name,
-                    'data': None,
-                    'error': f'未找到该剧集: {drama_name}',
-                    'similarity_score': 0
-                })
+        search_results = batch_search_items_by_names(drama_names, 'series')
+        results = search_results if only_return_requested else [item for item in search_results if item.get('data')]
 
         return jsonify({
             'code': 0,

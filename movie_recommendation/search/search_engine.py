@@ -1,32 +1,34 @@
-from utils.text_utils import extract_keywords, calculate_similarity, parse_natural_language
-from data.dataset_loader import load_dataset
 from config import Config
+from data.dataset_loader import load_dataset
+from db.content_repository import (
+    find_content_item_by_name as find_content_item_by_name_db,
+    find_content_items_by_names as find_content_items_by_names_db,
+    search_content_items as search_content_items_db,
+)
+from utils.text_utils import calculate_similarity, parse_natural_language
 
 
 def search_in_dataset(df, search_params):
-    """在数据集中搜索"""
+    """Fallback CSV search kept for compatibility when DB is unavailable."""
     results = []
     keywords = search_params.get('keywords', [])
+    keyword_text = ' '.join(keywords).strip()
 
     for _, row in df.iterrows():
         match_score = 0
 
-        # 标题匹配
         title = str(row.get('title', ''))
-        title_score = calculate_similarity(' '.join(keywords), title)
-        match_score += title_score * 0.5
+        if keyword_text:
+            match_score += calculate_similarity(keyword_text, title) * 0.5
 
-        # 描述匹配（如果有）
-        description = str(row.get('description', ''))
-        desc_score = calculate_similarity(' '.join(keywords), description)
-        match_score += desc_score * 0.2
+        description = str(row.get('description', '') or row.get('plot', ''))
+        if keyword_text:
+            match_score += calculate_similarity(keyword_text, description) * 0.2
 
-        # 类型匹配
         genres = str(row.get('genres', ''))
         genre_score = sum(1 for kw in keywords if kw in genres) / max(len(keywords), 1)
         match_score += genre_score * 0.2
 
-        # 导演/演员匹配
         director = str(row.get('director', ''))
         actors = str(row.get('actors', ''))
         person_score = sum(1 for kw in keywords if kw in director or kw in actors) / max(len(keywords), 1)
@@ -35,128 +37,148 @@ def search_in_dataset(df, search_params):
         if match_score >= Config.SEARCH_THRESHOLD:
             item = row.to_dict()
             item['match_score'] = match_score
+            item['similarity_score'] = match_score
             results.append(item)
 
     return results
 
 
+def _apply_search_filters(results, search_params):
+    filtered = list(results or [])
+
+    if search_params.get('genres'):
+        filtered = [r for r in filtered if any(g in str(r.get('genres', '')) for g in search_params['genres'])]
+
+    if search_params.get('year'):
+        year = str(search_params['year'])
+        filtered = [r for r in filtered if str(r.get('year', '')) == year]
+
+    return filtered
+
+
+def _finalize_item(item, content_type=None):
+    normalized = dict(item or {})
+    normalized['id'] = str(normalized.get('id', '') or '')
+    normalized['title'] = str(normalized.get('title', '') or normalized.get('name', '') or '')
+    normalized['name'] = str(normalized.get('name', '') or normalized['title'])
+    normalized['cover_url'] = str(normalized.get('cover_url', '') or normalized.get('coverUrl', '') or '')
+    normalized['coverUrl'] = normalized['cover_url']
+    normalized['content_type'] = normalized.get('content_type') or content_type or normalized.get('type', '')
+    if 'match_score' in normalized and 'similarity_score' not in normalized:
+        normalized['similarity_score'] = normalized['match_score']
+    return normalized
+
+
 def smart_search(query, content_type=None):
-    """智能搜索（支持自然语言）"""
-    # 解析自然语言查询
+    """Database-first smart search with CSV fallback."""
     search_params = parse_natural_language(query)
 
-    # 加载相关数据集
-    results = []
+    db_results = search_content_items_db(query, content_type=content_type, limit=Config.MAX_SEARCH_RESULTS)
+    if db_results:
+        db_results = [_finalize_item(item, content_type) for item in db_results]
+        db_results = _apply_search_filters(db_results, search_params)
+        return db_results[:Config.MAX_SEARCH_RESULTS]
 
-    if content_type:
-        types_to_search = [content_type]
-    else:
-        types_to_search = ['movie', 'series']
+    results = []
+    types_to_search = [content_type] if content_type else ['movie', 'series']
 
     for c_type in types_to_search:
         df = load_dataset(c_type)
         if df.empty:
             continue
-
-        # 执行搜索
         type_results = search_in_dataset(df, search_params)
         for item in type_results:
             item['content_type'] = c_type
+            item['type'] = c_type
         results.extend(type_results)
 
-    # 按相似度排序
     results.sort(key=lambda x: x.get('match_score', 0), reverse=True)
-
-    # 应用过滤器
-    if search_params.get('genres'):
-        results = [r for r in results if any(g in r.get('genres', '') for g in search_params['genres'])]
-
-    if search_params.get('year'):
-        year = search_params['year']
-        results = [r for r in results if str(r.get('year', '')) == str(year)]
-
+    results = [_finalize_item(item, item.get('content_type')) for item in results]
+    results = _apply_search_filters(results, search_params)
     return results[:Config.MAX_SEARCH_RESULTS]
 
 
-def search_drama_by_name(drama_name):
-    """根据剧集名称查询详细信息"""
-    from data.dataset_loader import load_dataset
+def search_item_by_name(item_name, item_type='movie'):
+    """Find the best-matching single item, preferring DB search."""
+    db_result = find_content_item_by_name_db(item_name, content_type=item_type)
+    if db_result:
+        return _finalize_item(db_result, item_type)
 
-    # 读取CSV文件
-    drama_df = load_dataset('series')
-    if drama_df.empty:
+    df = load_dataset(item_type)
+    if df.empty:
         return None
 
-    # 搜索匹配的剧集
     best_match = None
     best_score = 0
+    normalized_name = str(item_name or '').strip()
 
-    for _, row in drama_df.iterrows():
+    for _, row in df.iterrows():
         title = str(row.get('title', '')).strip()
         if not title:
             continue
 
-        # 计算相似度
-        similarity = calculate_similarity(drama_name, title)
-
-        # 完全匹配优先
-        if drama_name.lower() == title.lower():
+        similarity = calculate_similarity(normalized_name, title)
+        if normalized_name.lower() == title.lower():
             best_match = row
             best_score = 1.0
             break
 
-        # 相似度超过阈值
         if similarity > 0.7 and similarity > best_score:
             best_match = row
             best_score = similarity
 
-    if best_match is not None:
-        result = {
-            "id": str(best_match.get('id', '')),
-            "title": str(best_match.get('title', '')),
-            "name": str(best_match.get('name', str(best_match.get('title', '')))),
-            "genres": str(best_match.get('genres', '')),
-            "rating": str(best_match.get('rating', '')),
-            "cover_url": str(best_match.get('cover_url', '')),
-            "coverUrl": str(best_match.get('cover_url', '')),
-            "year": str(best_match.get('year', '')),
-            "director": str(best_match.get('director', '')),
-            "actors": str(best_match.get('actors', '')),
-            "popularity": str(best_match.get('popularity', '')),
-            "similarity_score": best_score,
-            "episodes": str(best_match.get('episodes', best_match.get('total_episodes', '未知集数'))),
-            "region": str(best_match.get('region', best_match.get('area', '未知地区'))),
-            "status": str(best_match.get('status', '完结'))
-        }
-        return result
+    if best_match is None:
+        return None
 
-    return None
+    result = best_match.to_dict()
+    result['similarity_score'] = best_score
+    result['match_score'] = best_score
+    return _finalize_item(result, item_type)
 
 
-def batch_search_dramas(drama_names):
-    """批量查询剧集信息"""
+def batch_search_items_by_names(item_names, item_type='movie'):
+    """Batch version of single-item search."""
+    db_results = find_content_items_by_names_db(item_names, content_type=item_type)
+    if db_results:
+        normalized_results = []
+        for entry in db_results:
+            item = entry.get('data')
+            normalized_results.append({
+                'name_requested': entry.get('name_requested', ''),
+                'matched_title': entry.get('matched_title', ''),
+                'data': _finalize_item(item, item_type) if item else None,
+                'similarity_score': entry.get('similarity_score', 0),
+            })
+        return normalized_results
+
     results = []
-
-    for name in drama_names:
-        drama_name = str(name).strip()
-        if not drama_name:
+    for raw_name in item_names or []:
+        normalized_name = str(raw_name or '').strip()
+        if not normalized_name:
             continue
 
-        result = search_drama_by_name(drama_name)
+        result = search_item_by_name(normalized_name, item_type)
         if result:
             results.append({
-                'name_requested': drama_name,
+                'name_requested': normalized_name,
                 'matched_title': result['title'],
                 'data': result,
-                'similarity_score': result['similarity_score']
+                'similarity_score': result.get('similarity_score', result.get('match_score', 0)),
             })
         else:
             results.append({
-                'name_requested': drama_name,
-                'matched_title': drama_name,
+                'name_requested': normalized_name,
+                'matched_title': normalized_name,
                 'data': None,
-                'error': f'未找到该剧集: {drama_name}',
-                'similarity_score': 0
+                'error': f'未找到该内容: {normalized_name}',
+                'similarity_score': 0,
             })
-
     return results
+
+
+def search_drama_by_name(drama_name):
+    return search_item_by_name(drama_name, 'series')
+
+
+def batch_search_dramas(drama_names):
+    return batch_search_items_by_names(drama_names, 'series')

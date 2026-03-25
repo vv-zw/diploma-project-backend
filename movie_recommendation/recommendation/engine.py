@@ -1380,6 +1380,7 @@ def normalize_preference_item(item, default_type='movie', dataset_ids=None):
         'title': str(item.get('title', '') or name).strip() or name,
         'genres': parse_multi_value(item.get('genres', [])),
         'rating': item.get('rating', 0),
+        'comment': str(item.get('comment', '')).strip(),
         'cover_url': item.get('cover_url', ''),
         'year': item.get('year', 0),
         'director': str(item.get('director', '')).strip(),

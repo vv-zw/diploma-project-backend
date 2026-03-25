@@ -22,7 +22,13 @@ def get_user_preferences(user_id: str = "user_default", content_type: Optional[s
         where_sql += " AND content_type = %(content_type)s"
         params["content_type"] = str(content_type).strip().lower()
 
-    sql = f"""
+    sql_with_comment = f"""
+    SELECT content_id, content_type, title, genres, rating, year, director, actors, cover_url, comment
+    FROM {Config.PGSCHEMA}.user_preferences
+    {where_sql}
+    ORDER BY created_at ASC, id ASC
+    """
+    sql_without_comment = f"""
     SELECT content_id, content_type, title, genres, rating, year, director, actors, cover_url
     FROM {Config.PGSCHEMA}.user_preferences
     {where_sql}
@@ -32,8 +38,16 @@ def get_user_preferences(user_id: str = "user_default", content_type: Optional[s
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, params)
-                rows = cur.fetchall()
+                try:
+                    cur.execute(sql_with_comment, params)
+                    rows = cur.fetchall()
+                    has_comment = True
+                except Exception as exc:
+                    if 'comment' not in str(exc).lower():
+                        raise
+                    cur.execute(sql_without_comment, params)
+                    rows = cur.fetchall()
+                    has_comment = False
     except Exception as exc:
         print(f"[WARN] Failed to load user preferences from PostgreSQL: {exc}")
         return result
@@ -55,6 +69,7 @@ def get_user_preferences(user_id: str = "user_default", content_type: Optional[s
                 "director": row[6] or "",
                 "actors": row[7] or "",
                 "cover_url": row[8] or "",
+                "comment": row[9] or "" if has_comment else "",
                 "content_type": item_type,
             }
         )
@@ -68,7 +83,15 @@ def replace_user_preferences(user_id: str, preferences_by_type: Dict[str, List[d
         return False
 
     delete_sql = f"DELETE FROM {Config.PGSCHEMA}.user_preferences WHERE user_id = %(user_id)s"
-    insert_sql = f"""
+    insert_sql_with_comment = f"""
+    INSERT INTO {Config.PGSCHEMA}.user_preferences (
+        user_id, content_id, content_type, title, genres, rating, year, director, actors, cover_url, comment, source
+    ) VALUES (
+        %(user_id)s, %(content_id)s, %(content_type)s, %(title)s, %(genres)s,
+        %(rating)s, %(year)s, %(director)s, %(actors)s, %(cover_url)s, %(comment)s, %(source)s
+    )
+    """
+    insert_sql_without_comment = f"""
     INSERT INTO {Config.PGSCHEMA}.user_preferences (
         user_id, content_id, content_type, title, genres, rating, year, director, actors, cover_url, source
     ) VALUES (
@@ -92,6 +115,7 @@ def replace_user_preferences(user_id: str, preferences_by_type: Dict[str, List[d
                     "director": str(item.get("director", "")).strip(),
                     "actors": _stringify_multi_value(item.get("actors", "")),
                     "cover_url": str(item.get("cover_url", "")).strip(),
+                    "comment": str(item.get("comment", "")).strip(),
                     "source": "sync_user_data",
                 }
             )
@@ -101,7 +125,17 @@ def replace_user_preferences(user_id: str, preferences_by_type: Dict[str, List[d
             with conn.cursor() as cur:
                 cur.execute(delete_sql, {"user_id": user_id})
                 if records:
-                    cur.executemany(insert_sql, records)
+                    try:
+                        cur.executemany(insert_sql_with_comment, records)
+                    except Exception as exc:
+                        if 'comment' not in str(exc).lower():
+                            raise
+                        fallback_records = []
+                        for record in records:
+                            fallback_record = dict(record)
+                            fallback_record.pop("comment", None)
+                            fallback_records.append(fallback_record)
+                        cur.executemany(insert_sql_without_comment, fallback_records)
             conn.commit()
         return True
     except Exception as exc:
